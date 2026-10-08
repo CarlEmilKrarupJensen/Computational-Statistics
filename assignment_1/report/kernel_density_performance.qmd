@@ -1,1 +1,1416 @@
+---
+title: "Kernel Density Estimation — Computational Performance"
+subtitle: "Benchmarking, profiling, and optimization"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+# Introduction
+
+The statistical correctness of the implementation was established using
+
+unit tests and simulation experiments.
+
+The purpose of this section is to investigate the computational performance
+
+of the implementation.
+
+The analysis follows three steps:
+
+1. Benchmark the original implementations.
+
+2. Profile the code to identify bottlenecks.
+
+3. Introduce alternative implementations and quantify the resulting
+
+   speed, memory, and accuracy trade-offs.
+
+```{r}
+#| label: setup
+#| include: false
+
+library(bench)
+
+library(ggplot2)
+
+library(dplyr)
+
+library(patchwork)
+
+library(ggbeeswarm)
+
+source("project_A/kernels.R")
+
+source("project_A/kde.R")
+
+source("project_A/bandwidth_amise.R")
+
+source("project_A/bandwidth_cv.R")
+
+source("project_A/utils.R")
+
+source("project_A/simulation_utils.R")
+
+set.seed(2026)
+
+```
+
+```{r}
+#| label: profiling-helper
+
+profile_code <- function(
+
+    code,
+
+    interval = 0.001
+
+) {
+
+  profile_file <- tempfile()
+
+  Rprof(
+
+    filename = profile_file,
+
+    interval = interval,
+
+    memory.profiling = TRUE
+
+  )
+
+  tryCatch(
+
+    {
+
+      invisible(force(code))
+
+    },
+
+    finally = {
+
+      Rprof(NULL)
+
+    }
+
+  )
+
+  result <- summaryRprof(
+
+    profile_file,
+
+    memory = "both"
+
+  )
+
+  unlink(profile_file)
+
+  result
+
+}
+
+profile_top <- function(
+
+    profile,
+
+    type = c("self", "total"),
+
+    n = 10
+
+) {
+
+  type <- match.arg(type)
+
+  x <- switch(
+
+    type,
+
+    self = profile$by.self,
+
+    total = profile$by.total
+
+  )
+
+  result <- head(
+
+    x,
+
+    n
+
+  )
+
+  result$function_name <- rownames(result)
+
+  rownames(result) <- NULL
+
+  result
+
+}
+
+```
+
+```{r}
+#| label: profile-kde
+
+set.seed(1)
+
+x_profile <- rnorm(50000)
+
+kde_profile <- profile_code(
+
+  kernel_density_estimator(
+
+    x = x_profile,
+
+    h = 0.5,
+
+    n = 1024
+
+  )
+
+)
+
+```
+
+```{r}
+#| label: profile-kde-total
+
+cat("KDE_profile (self):\n")
+
+profile_top(
+
+  kde_profile,
+
+  type = "self"
+
+)
+
+```
+
+```{r}
+#| label: performance-step-05
+
+cat("KDE_profile (total):\n")
+
+profile_top(
+
+  kde_profile,
+
+  type = "total"
+
+)
+
+```
+
+```{r}
+#| label: profile-amise
+
+set.seed(2)
+
+x_profile_amise <- rnorm(3000)
+
+amise_profile <- profile_code(
+
+  amise_bandwidth(
+
+    x_profile_amise
+
+  )
+
+)
+
+```
+
+```{r}
+#| label: performance-step-07
+
+cat("AMISE_profile (self):\n")
+
+profile_top(
+
+  amise_profile,
+
+  type = "self",
+
+  n = 10
+
+)
+
+```
+
+```{r}
+#| label: performance-step-08
+
+cat("AMISE_profile (total):\n")
+
+profile_top(
+
+  amise_profile,
+
+  type = "total",
+
+  n = 10
+
+)
+
+```
+
+```{r}
+#| label: profile-cv-loglik
+
+set.seed(3)
+
+x_profile_cv <- rnorm(800)
+
+h_grid_profile <- seq(
+
+  0.05,
+
+  1.5,
+
+  length.out = 50
+
+)
+
+cv_loglik_profile <- profile_code(
+
+  cv_loglik_bandwidth(
+
+    x = x_profile_cv,
+
+    h_grid = h_grid_profile
+
+  )
+
+)
+
+```
+
+```{r}
+#| label: profile-lscv
+
+set.seed(3)
+
+lscv_profile <- profile_code(
+
+  lscv_bandwidth(
+
+    x = x_profile_cv,
+
+    h_grid = h_grid_profile
+
+  )
+
+)
+
+```
+
+```{r}
+#| label: performance-step-11
+
+cat("cv_loglik_profile (self):\n")
+
+profile_top(
+
+  cv_loglik_profile,
+
+  type = "self",
+
+  n = 12
+
+)
+
+```
+
+```{r}
+#| label: performance-step-12
+
+cat("cv_loglik_profile (total):\n")
+
+profile_top(
+
+  cv_loglik_profile,
+
+  type = "total",
+
+  n = 12
+
+)
+
+```
+
+```{r}
+#| label: performance-step-13
+
+cat("lscv_profile (self):\n")
+
+profile_top(
+
+  lscv_profile,
+
+  type = "self",
+
+  n = 12
+
+)
+
+```
+
+```{r}
+#| label: performance-step-14
+
+cat("lscv_profile (total):\n")
+
+profile_top(
+
+  lscv_profile,
+
+  type = "total",
+
+  n = 12
+
+)
+
+```
+
+### Benchmarking alternative implementations
+
+The binned approximation below uses **nearest-center assignment**, not linear interpolation. Its error is therefore evaluated empirically rather than treated as numerically exact.
+
+```{r}
+#| label: performance-step-15
+
+#' Exact matrix-based KDE
+
+#'
+
+#' Eliminates the R-level loop over evaluation points by constructing
+
+#' the complete m x n distance matrix.
+
+#'
+
+#' Time complexity:   O(m n)
+
+#' Memory complexity: O(m n)
+
+kde_at_matrix <- function(
+
+    eval_points,
+
+    x,
+
+    h,
+
+    kernel = epanechnikov_kernel
+
+) {
+
+  D <- outer(
+
+    eval_points,
+
+    x,
+
+    "-"
+
+  ) / h
+
+  K <- kernel(D)
+
+  rowSums(K) / (length(x) * h)
+
+}
+
+```
+
+```{r}
+#| label: performance-step-16
+
+kernel_density_estimator_matrix <- function(
+
+    x,
+
+    h,
+
+    n = 512,
+
+    kernel = epanechnikov_kernel,
+
+    extend = 1
+
+) {
+
+  r <- range(x)
+
+  grid <- seq(
+
+    r[1] - extend * h,
+
+    r[2] + extend * h,
+
+    length.out = n
+
+  )
+
+  y <- kde_at_matrix(
+
+    eval_points = grid,
+
+    x = x,
+
+    h = h,
+
+    kernel = kernel
+
+  )
+
+  list(
+
+    x = grid,
+
+    y = y,
+
+    bandwidth = h
+
+  )
+
+}
+
+```
+
+```{r}
+#| label: performance-step-17
+
+#' Exact block-wise KDE
+
+#'
+
+#' Evaluates several grid points simultaneously while limiting
+
+#' the size of the temporary distance matrix.
+
+#'
+
+#' Time complexity:   O(m n)
+
+#' Memory complexity: O(block_size * n)
+
+kde_at_chunked <- function(
+
+    eval_points,
+
+    x,
+
+    h,
+
+    kernel = epanechnikov_kernel,
+
+    block_size = 128
+
+) {
+
+  m <- length(eval_points)
+
+  result <- numeric(m)
+
+  starts <- seq(
+
+    1,
+
+    m,
+
+    by = block_size
+
+  )
+
+  for (start in starts) {
+
+    end <- min(
+
+      start + block_size - 1,
+
+      m
+
+    )
+
+    idx <- start:end
+
+    D <- outer(
+
+      eval_points[idx],
+
+      x,
+
+      "-"
+
+    ) / h
+
+    result[idx] <-
+
+      rowSums(kernel(D)) /
+
+      (length(x) * h)
+
+  }
+
+  result
+
+}
+
+```
+
+```{r}
+#| label: performance-step-18
+
+kernel_density_estimator_chunked <- function(
+
+    x,
+
+    h,
+
+    n = 512,
+
+    kernel = epanechnikov_kernel,
+
+    extend = 1,
+
+    block_size = 128
+
+) {
+
+  r <- range(x)
+
+  grid <- seq(
+
+    r[1] - extend * h,
+
+    r[2] + extend * h,
+
+    length.out = n
+
+  )
+
+  y <- kde_at_chunked(
+
+    eval_points = grid,
+
+    x = x,
+
+    h = h,
+
+    kernel = kernel,
+
+    block_size = block_size
+
+  )
+
+  list(
+
+    x = grid,
+
+    y = y,
+
+    bandwidth = h
+
+  )
+
+}
+
+```
+
+```{r}
+#| label: performance-step-19
+
+#' Assign observations to their nearest equally spaced bin center
+
+kde_bin_weights <- function(
+
+    x,
+
+    lower,
+
+    upper,
+
+    B
+
+) {
+
+  if (B < 2) {
+
+    stop("B must be at least 2.")
+
+  }
+
+  delta <- (
+
+    upper - lower
+
+  ) / (B - 1)
+
+  index <- floor(
+
+    (x - lower) / delta + 0.5
+
+  ) + 1
+
+  # Protect against numerical boundary effects.
+
+  index <- pmax(
+
+    1,
+
+    pmin(B, index)
+
+  )
+
+  counts <- tabulate(
+
+    index,
+
+    nbins = B
+
+  )
+
+  counts / length(x)
+
+}
+
+```
+
+```{r}
+#| label: performance-step-20
+
+#' Approximate KDE using nearest-center binning
+
+#'
+
+#' Replaces n observations with B weighted bin centers (nearest-bin assignment).
+
+#'
+
+#' Approximate complexity:
+
+#'   O(n) + O(m B)
+
+kde_at_binned <- function(
+
+    eval_points,
+
+    x,
+
+    h,
+
+    B = 256,
+
+    kernel = epanechnikov_kernel
+
+) {
+
+  lower <- min(eval_points)
+
+  upper <- max(eval_points)
+
+  centers <- seq(
+
+    lower,
+
+    upper,
+
+    length.out = B
+
+  )
+
+  weights <- kde_bin_weights(
+
+    x = x,
+
+    lower = lower,
+
+    upper = upper,
+
+    B = B
+
+  )
+
+  D <- outer(
+
+    eval_points,
+
+    centers,
+
+    "-"
+
+  ) / h
+
+  K <- kernel(D) / h
+
+  drop(
+
+    K %*% weights
+
+  )
+
+}
+
+```
+
+```{r}
+#| label: performance-step-21
+
+kernel_density_estimator_binned <- function(
+
+    x,
+
+    h,
+
+    n = 512,
+
+    B = 256,
+
+    kernel = epanechnikov_kernel,
+
+    extend = 1
+
+) {
+
+  r <- range(x)
+
+  grid <- seq(
+
+    r[1] - extend * h,
+
+    r[2] + extend * h,
+
+    length.out = n
+
+  )
+
+  y <- kde_at_binned(
+
+    eval_points = grid,
+
+    x = x,
+
+    h = h,
+
+    B = B,
+
+    kernel = kernel
+
+  )
+
+  list(
+
+    x = grid,
+
+    y = y,
+
+    bandwidth = h
+
+  )
+
+}
+
+```
+
+```{r}
+#| label: performance-step-22
+
+set.seed(1)
+
+x_check <- rnorm(500)
+
+h_check <- 0.4
+
+grid_check <- seq(
+
+  min(x_check) - h_check,
+
+  max(x_check) + h_check,
+
+  length.out = 512
+
+)
+
+y_current <- kde_at(
+
+  grid_check,
+
+  x_check,
+
+  h_check
+
+)
+
+y_matrix <- kde_at_matrix(
+
+  grid_check,
+
+  x_check,
+
+  h_check
+
+)
+
+y_binned <- kde_at_binned(
+
+  grid_check,
+
+  x_check,
+
+  h_check
+
+)
+
+max(abs(y_current - y_matrix))
+
+max(abs(y_current - y_binned))
+
+```
+
+```{r}
+#| label: performance-step-23
+
+library(testthat)
+
+test_that("matrix KDE agrees with reference KDE", {
+
+  set.seed(1)
+
+  x <- rnorm(100)
+
+  z <- seq(-3, 3, length.out = 100)
+
+  expect_equal(
+
+    kde_at_matrix(z, x, 0.5),
+
+    kde_at(z, x, 0.5),
+
+    tolerance = 1e-12
+
+  )
+
+})
+
+test_that("binned KDE is a reasonable approximation to reference KDE", {
+
+  set.seed(1)
+
+  x <- rnorm(100)
+
+  z <- seq(-3, 3, length.out = 100)
+
+  expect_equal(
+
+    kde_at_binned(z, x, 0.5),
+
+    kde_at(z, x, 0.5),
+
+    tolerance = 5e-2
+
+  )
+
+})
+
+```
+
+```{r}
+#| label: performance-step-24
+
+#' Epanechnikov KDE using R's density()
+
+#'
+
+#' Converts our support-scale bandwidth h to density()'s
+
+#' standard-deviation bandwidth convention.
+
+kde_density_R <- function(
+
+    x,
+
+    h,
+
+    n = 512,
+
+    extend = 1
+
+) {
+
+  r <- range(x)
+
+  lower <- r[1] - extend * h
+
+  upper <- r[2] + extend * h
+
+  fit <- density(
+
+    x,
+
+    bw = h / sqrt(5),
+
+    kernel = "epanechnikov",
+
+    n = n,
+
+    from = lower,
+
+    to = upper
+
+  )
+
+  list(
+
+    x = fit$x,
+
+    y = fit$y,
+
+    bandwidth = h
+
+  )
+
+}
+
+```
+
+```{r}
+#| label: performance-step-25
+
+set.seed(1)
+
+x_accuracy <- rnorm(5000)
+
+h_accuracy <- 0.4
+
+reference <- kernel_density_estimator(
+
+  x = x_accuracy,
+
+  h = h_accuracy,
+
+  n = 512
+
+)
+
+matrix_fit <- kernel_density_estimator_matrix(
+
+  x = x_accuracy,
+
+  h = h_accuracy,
+
+  n = 512
+
+)
+
+chunked_fit <- kernel_density_estimator_chunked(
+
+  x = x_accuracy,
+
+  h = h_accuracy,
+
+  n = 512
+
+)
+
+binned_fit <- kernel_density_estimator_binned(
+
+  x = x_accuracy,
+
+  h = h_accuracy,
+
+  n = 512,
+
+  B = 256
+
+)
+
+r_fit <- kde_density_R(
+
+  x = x_accuracy,
+
+  h = h_accuracy,
+
+  n = 512
+
+)
+
+```
+
+```{r}
+#| label: performance-step-26
+
+accuracy_comparison <- data.frame(
+
+  method = c(
+
+    "Matrix",
+
+    "Chunked",
+
+    "Binned",
+
+    "density()"
+
+  ),
+
+  max_abs_error = c(
+
+    max(abs(
+
+      matrix_fit$y -
+
+        reference$y
+
+    )),
+
+    max(abs(
+
+      chunked_fit$y -
+
+        reference$y
+
+    )),
+
+    max(abs(
+
+      binned_fit$y -
+
+        reference$y
+
+    )),
+
+    max(abs(
+
+      r_fit$y -
+
+        reference$y
+
+    ))
+
+  )
+
+)
+
+accuracy_comparison
+
+```
+
+```{r}
+#| label: performance-step-27
+
+library(bench)
+
+kde_bench <- bench::press(
+
+  N = 2^(7:13),
+
+  {
+
+    x <- rnorm(N)
+
+    h <- 0.4
+
+    grid <- seq(
+
+      min(x) - h,
+
+      max(x) + h,
+
+      length.out = 512
+
+    )
+
+    bench::mark(
+
+      current = kde_at(
+
+        grid,
+
+        x,
+
+        h
+
+      ),
+
+      matrix = kde_at_matrix(
+
+        grid,
+
+        x,
+
+        h
+
+      ),
+
+      binned = kde_at_binned(
+
+        grid,
+
+        x,
+
+        h,
+
+        B = 256
+
+      ),
+
+      R_density = density(
+
+        x,
+
+        bw = h / sqrt(5),
+
+        kernel = "epanechnikov",
+
+        n = 512,
+
+        from = min(grid),
+
+        to = max(grid)
+
+      )$y,
+
+      check = FALSE,
+
+      min_iterations = 5
+
+    )
+
+  }
+
+)
+
+```
+
+```{r}
+#| label: performance-step-28
+
+kde_bench_plot <- kde_bench |>
+
+  mutate(
+
+    method = as.character(expression),
+
+    median_seconds = as.numeric(median)
+
+  )
+
+p_scaling <- ggplot(
+
+  kde_bench_plot,
+
+  aes(
+
+    x = N,
+
+    y = median_seconds,
+
+    color = method
+
+  )
+
+) +
+
+  geom_point() +
+
+  geom_line() +
+
+  scale_x_continuous(
+
+    trans = "log2",
+
+    breaks = unique(kde_bench_plot$N)
+
+  ) +
+
+  scale_y_log10() +
+
+  labs(
+
+    title = "Runtime scaling",
+
+    #subtitle = "512 evaluation points",
+
+    x = "Sample size n",
+
+    y = "Median runtime (seconds)",
+
+    color = "Implementation"
+
+  ) +
+
+  theme_minimal(base_size = 11) +
+
+  theme(
+
+    legend.position = "bottom"
+
+  )
+
+```
+
+```{r}
+#| label: kde-beeswarm-benchmark
+#| cache: true
+
+set.seed(2026)
+
+N_beeswarm <- 4096
+
+x_bee <- rnorm(N_beeswarm)
+
+h_bee <- 0.4
+
+grid_bee <- seq(
+
+  min(x_bee) - h_bee,
+
+  max(x_bee) + h_bee,
+
+  length.out = 512
+
+)
+
+kde_bee_bench <- bench::mark(
+
+  current = kde_at(
+
+    grid_bee,
+
+    x_bee,
+
+    h_bee
+
+  ),
+
+  matrix = kde_at_matrix(
+
+    grid_bee,
+
+    x_bee,
+
+    h_bee
+
+  ),
+
+  binned = kde_at_binned(
+
+    grid_bee,
+
+    x_bee,
+
+    h_bee,
+
+    B = 256
+
+  ),
+
+  R_density = density(
+
+    x_bee,
+
+    bw = h_bee / sqrt(5),
+
+    kernel = "epanechnikov",
+
+    n = 512,
+
+    from = min(grid_bee),
+
+    to = max(grid_bee)
+
+  )$y,
+
+  check = FALSE,
+
+  min_iterations = 20
+
+)
+
+p_beeswarm <- plot(
+
+  kde_bee_bench
+
+)
+
+```
+
+```{r}
+#| label: performance-step-30
+
+p_runtime <- p_scaling + p_beeswarm +
+  plot_layout(widths = c(1.4, 1))
+
+p_runtime
+dir.create("plots", showWarnings = FALSE, recursive = TRUE)
+ggsave("plots/runtime_comparison.png", p_runtime, width = 12, height = 5.6, dpi = 150)
+
+```
+
+```{r}
+#| label: performance-step-31
+
+kde_memory_plot <- kde_bench |>
+
+  dplyr::mutate(
+
+    method = as.character(expression),
+
+    memory_mb =
+
+      as.numeric(mem_alloc) /
+
+      1024^2
+
+  )
+
+p_memory <- ggplot(
+
+  kde_memory_plot,
+
+  aes(
+
+    x = N,
+
+    y = memory_mb,
+
+    color = method
+
+  )
+
+) +
+
+  geom_point() +
+
+  geom_line() +
+
+  scale_x_log10() +
+
+  scale_y_log10() +
+
+  labs(
+
+    title = "Memory allocation of KDE implementations",
+
+    x = "Sample size n",
+
+    y = "Memory allocated (MB)",
+
+    color = "Implementation"
+
+  ) +
+
+  theme_minimal(base_size = 12)
+
+p_memory
+dir.create("plots", showWarnings = FALSE, recursive = TRUE)
+ggsave("plots/memory_comparison.png", p_memory, width = 10, height = 5, dpi = 150)
+
+```
 

@@ -1,0 +1,830 @@
+---
+title: "Kernel Density Estimation — Simulation Study"
+subtitle: "AMISE, likelihood cross-validation, and least-squares cross-validation"
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    fig-width: 8
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Introduction
+
+The purpose of this simulation study is to investigate the statistical
+
+behaviour of different bandwidth-selection methods for kernel density
+
+estimation using the Epanechnikov kernel.
+
+We compare three bandwidth selectors:
+
+1. an AMISE plug-in estimator,
+
+2. likelihood cross-validation,
+
+3. least-squares cross-validation (LSCV).
+
+Because the true density is known in simulation, the selected bandwidths
+
+can also be compared with a sample-specific oracle bandwidth that minimizes
+
+the integrated squared error (ISE).
+
+The simulations consider distributions with different characteristics:
+
+- a smooth symmetric normal density,
+
+- a skewed Gamma density,
+
+- a multimodal Gaussian mixture.
+
+This allows us to study how the methods respond to different underlying
+
+density shapes.
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+library(ggplot2)
+library(patchwork)
+source("/Users/carl-emilkrarupjensen/Desktop/Kandidat/Compstat/Compstat R/assignment_1/project_A/kernels.R")
+source("/Users/carl-emilkrarupjensen/Desktop/Kandidat/Compstat/Compstat R/assignment_1/project_A/kde.R")
+source("/Users/carl-emilkrarupjensen/Desktop/Kandidat/Compstat/Compstat R/assignment_1/project_A/bandwidth_amise.R")
+source("/Users/carl-emilkrarupjensen/Desktop/Kandidat/Compstat/Compstat R/assignment_1/project_A/bandwidth_cv.R")
+source("/Users/carl-emilkrarupjensen/Desktop/Kandidat/Compstat/Compstat R/assignment_1/project_A/utils.R")
+source("/Users/carl-emilkrarupjensen/Desktop/Kandidat/Compstat/Compstat R/assignment_1/project_A/simulation_utils.R")
+set.seed(2026)
+scenarios <- simulation_scenarios()
+# Save optional copies of figures beside the report.
+dir.create("plots", showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+getwd()
+```
+
+# Background
+
+## Kernel density estimation
+
+Given observations $X_1,\ldots,X_N$, the kernel density estimator is
+
+$$
+\hat f_h(x) = \frac{1}{Nh}\sum_{i=1}^N K\left(\frac{x-X_i}{h}\right).
+$$
+
+We use the Epanechnikov kernel,
+
+$$
+K(u) = \frac34(1-u^2)\mathbf{1}_{\{|u|\leq1\}}.
+$$
+
+The bandwidth $h>0$ controls the bias–variance trade-off. Its mean integrated squared error (MISE) is
+
+$$
+\operatorname{MISE}(h) = \int \operatorname{Var}\{\hat f_h(x)\}\,dx
++ \int \operatorname{Bias}\{\hat f_h(x)\}^2\,dx.
+$$
+
+Smaller bandwidths typically reduce bias but increase variance, while larger bandwidths smooth more aggressively.
+
+## AMISE plug-in selection
+
+Assuming sufficient smoothness of the true density $f_0$, the asymptotic mean integrated squared error is
+
+$$
+\operatorname{AMISE}(h) = \frac{\|K\|_2^2}{Nh}
++ \frac{h^4\sigma_K^4}{4}\|f_0''\|_2^2,
+$$
+
+where $\sigma_K^2=\int u^2K(u)\,du$. For the Epanechnikov kernel,
+
+$$
+\|K\|_2^2 = \frac35, \qquad \sigma_K^2 = \frac15.
+$$
+
+Minimizing AMISE with respect to $h$ yields
+
+$$
+h_{\mathrm{AMISE}} =
+\left(\frac{\|K\|_2^2}{N\sigma_K^4\|f_0''\|_2^2}\right)^{1/5}.
+$$
+
+Since $f_0''$ is unknown, we replace its integrated squared norm with an estimate based on a pilot Gaussian kernel density estimate $\tilde f_r$. Specifically,
+
+$$
+\|\tilde f_r''\|_2^2 = \frac{1}{N^2r^6}
+\sum_{i=1}^N\sum_{j=1}^N
+\int H''\left(\frac{x-X_i}{r}\right)
+H''\left(\frac{x-X_j}{r}\right)\,dx.
+$$
+
+We choose the pilot bandwidth using a Silverman-type rule, $r=0.9\tilde\sigma N^{-1/5}$, where $\tilde\sigma$ denotes the scale estimate used in the implementation.
+
+For efficiency, the Gaussian pilot can also be evaluated via the closed-form derivative convolution. Writing $\phi$ for the standard normal density and $d=(X_i-X_j)/r$,
+
+$$
+\int_{-\infty}^{\infty}\phi''(u)\phi''(u+d)\,du
+= \frac{d^4-12d^2+12}{32\sqrt\pi}\exp(-d^2/4).
+$$
+
+We compare the pilot calculation approaches in the implementation where relevant.
+
+## Cross-validation
+
+For likelihood cross-validation, observations are divided into $k$ folds. Let $F(i)$ denote the fold containing observation $i$, and let $T_i=\{j:j\notin F(i)\}$ be its training indices. The training-sample density estimate is
+
+$$
+\hat f_{h,-F(i)}(x) = \frac{1}{|T_i|h}
+\sum_{j\in T_i}K\left(\frac{x-X_j}{h}\right).
+$$
+
+The log-likelihood score and selected bandwidth are
+
+$$
+\ell_{\mathrm{CV}}(h) = \sum_{i=1}^N
+\log\hat f_{h,-F(i)}(X_i), \qquad
+h_{\mathrm{loglik}} = \operatorname*{arg\,max}_{h}\ell_{\mathrm{CV}}(h).
+$$
+
+Least-squares cross-validation (LSCV) instead minimizes an empirical approximation to integrated squared error. Using the leave-one-out estimate $\hat f_{h,-i}$,
+
+$$
+\operatorname{LSCV}(h) =
+\int \hat f_h(x)^2\,dx
+-\frac{2}{N}\sum_{i=1}^N\hat f_{h,-i}(X_i), \qquad
+h_{\mathrm{LSCV}}=\operatorname*{arg\,min}_h\operatorname{LSCV}(h).
+$$
+
+The integral can be approximated numerically using the trapezoidal rule, as implemented in the accompanying R functions. Likelihood CV is maximized, whereas LSCV is minimized.
+
+# Comparison across distributions
+
+```{r}
+#| label: scenario-summary
+scenario_summary <- data.frame(
+  Scenario = c(
+    "Standard normal",
+    "Gamma(2, 1)",
+    "Gaussian mixture"
+  ),
+  Property = c(
+    "Symmetric and unimodal",
+    "Skewed with boundary at zero",
+    "Multimodal"
+  )
+)
+scenario_summary
+```
+
+```{r}
+#| label: simulated-examples-data
+normal_example <- plot_single_example(
+  scenario = scenarios$normal,
+  n = 200,
+  h_grid = seq(0.05, 1.5, length.out = 60),
+  seed = 1
+)
+gamma_example <- plot_single_example(
+  scenario = scenarios$gamma,
+  n = 200,
+  h_grid = seq(0.05, 1.5, length.out = 60),
+  seed = 2
+)
+mixture_example <- plot_single_example(
+  scenario = scenarios$mixture,
+  n = 200,
+  h_grid = seq(0.05, 2, length.out = 60),
+  seed = 3
+)
+```
+
+```{r}
+#| label: simulated-examples-plot
+#| fig-width: 14
+#| fig-height: 4.5
+p_examples <- patchwork::wrap_plots(
+  normal_example$plot,
+  gamma_example$plot,
+  mixture_example$plot,
+  nrow = 1,
+  guides = "collect"
+) &
+  theme(
+    legend.position = "bottom"
+  )
+print(p_examples)
+#ggsave("plots/simulated_examples.png", plot = p_examples, width = 14, height = 4.5, dpi = 150)
+```
+
+```{r}
+#| label: simulated-examples-results
+normal_results_single <- normal_example$results
+normal_results_single$scenario <- "Normal"
+gamma_results_single <- gamma_example$results
+gamma_results_single$scenario <- "Gamma"
+mixture_results_single <- mixture_example$results
+mixture_results_single$scenario <- "Mixture"
+single_example_results <- rbind(
+  normal_results_single,
+  gamma_results_single,
+  mixture_results_single
+)
+single_example_results
+```
+
+```{r}
+#| label: cv-objective-data
+x_cv <- mixture_example$sample
+h_grid_cv <- seq(
+  0.05,
+  2,
+  length.out = 80
+)
+set.seed(100)
+fold_id <- make_folds(
+  x_cv,
+  k = 5
+)
+loglik_scores <- vapply(
+  h_grid_cv,
+  function(h) {
+    cv_loglik_score(
+      x = x_cv,
+      h = h,
+      fold_id = fold_id
+    )
+  },
+  numeric(1)
+)
+lscv_scores <- vapply(
+  h_grid_cv,
+  function(h) {
+    lscv_score(
+      x = x_cv,
+      h = h
+    )
+  },
+  numeric(1)
+)
+h_loglik <- h_grid_cv[
+  which.max(loglik_scores)
+]
+h_lscv <- h_grid_cv[
+  which.min(lscv_scores)
+]
+loglik_data <- data.frame(
+  bandwidth = h_grid_cv,
+  score = loglik_scores
+)
+lscv_data <- data.frame(
+  bandwidth = h_grid_cv,
+  score = lscv_scores
+)
+```
+
+```{r}
+#| label: cv-objective-plots
+#| fig-width: 11
+#| fig-height: 4.5
+p_loglik <- ggplot(
+  loglik_data,
+  aes(
+    x = bandwidth,
+    y = score
+  )
+) +
+  geom_line(
+    linewidth = 0.9
+  ) +
+  geom_vline(
+    xintercept = h_loglik,
+    linetype = 2
+  ) +
+  labs(
+    title = "Likelihood CV",
+    subtitle = paste0(
+      "Maximum at h = ",
+      round(h_loglik, 3)
+    ),
+    x = "Bandwidth",
+    y = "Validation log likelihood"
+  ) +
+  theme_minimal(base_size = 12)
+p_lscv <- ggplot(
+  lscv_data,
+  aes(
+    x = bandwidth,
+    y = score
+  )
+) +
+  geom_line(
+    linewidth = 0.9
+  ) +
+  geom_vline(
+    xintercept = h_lscv,
+    linetype = 2
+  ) +
+  labs(
+    title = "Least-squares CV",
+    subtitle = paste0(
+      "Minimum at h = ",
+      round(h_lscv, 3)
+    ),
+    x = "Bandwidth",
+    y = "LSCV score"
+  ) +
+  theme_minimal(base_size = 12)
+patchwork::wrap_plots(
+  p_loglik,
+  p_lscv,
+  nrow = 1
+)
+```
+
+```{r}
+#| label: simulation-study
+#| cache: false
+B <- 50
+n_sim <- 100
+set.seed(1001)
+normal_results <- run_simulation(
+  scenario = scenarios$normal,
+  n = n_sim,
+  h_grid = seq(
+    0.05,
+    1.5,
+    length.out = 40
+  ),
+  B = B,
+  repeats = 3
+)
+normal_results$scenario <- "Normal"
+set.seed(1002)
+gamma_results <- run_simulation(
+  scenario = scenarios$gamma,
+  n = n_sim,
+  h_grid = seq(
+    0.05,
+    1.5,
+    length.out = 40
+  ),
+  B = B,
+  repeats = 3
+)
+gamma_results$scenario <- "Gamma"
+set.seed(1003)
+mixture_results <- run_simulation(
+  scenario = scenarios$mixture,
+  n = n_sim,
+  h_grid = seq(
+    0.05,
+    2,
+    length.out = 40
+  ),
+  B = B,
+  repeats = 3
+)
+mixture_results$scenario <- "Mixture"
+all_results <- rbind(
+  normal_results,
+  gamma_results,
+  mixture_results
+)
+```
+
+```{r}
+#| label: oracle-comparison-data
+add_oracle_comparison <- function(results) {
+  oracle_results <- subset(
+    results,
+    method == "Oracle",
+    select = c(
+      replicate,
+      n,
+      scenario,
+      bandwidth,
+      ise
+    )
+  )
+  names(oracle_results)[
+    names(oracle_results) == "bandwidth"
+  ] <- "oracle_bandwidth"
+  names(oracle_results)[
+    names(oracle_results) == "ise"
+  ] <- "oracle_ise"
+  comparison <- merge(
+    subset(
+      results,
+      method != "Oracle"
+    ),
+    oracle_results,
+    by = c(
+      "replicate",
+      "n",
+      "scenario"
+    )
+  )
+  comparison$bandwidth_ratio <-
+    comparison$bandwidth /
+    comparison$oracle_bandwidth
+  comparison$ise_ratio <-
+    comparison$ise /
+    comparison$oracle_ise
+  comparison
+}
+oracle_comparison <- add_oracle_comparison(
+  all_results
+)
+```
+
+```{r}
+#| label: oracle-bandwidth-plot
+#| fig-width: 10
+#| fig-height: 5
+oracle_comparison$scenario <- factor(
+  oracle_comparison$scenario,
+  levels = c("Normal", "Gamma", "Mixture")
+)
+p_oracle_bandwidth <- ggplot(
+  oracle_comparison,
+  aes(
+    x = method,
+    y = bandwidth_ratio,
+    fill = method
+  )
+) +
+  geom_hline(
+    yintercept = 1,
+    linetype = 2
+  ) +
+  geom_boxplot(
+    show.legend = FALSE
+  ) +
+  facet_wrap(
+    ~ scenario
+  ) +
+  labs(
+    title = "Selected bandwidth relative to the oracle",
+    x = NULL,
+    y = expression(
+      h / h[oracle]
+    )
+  ) +
+  theme_minimal(base_size = 12)
+print(p_oracle_bandwidth)
+#ggsave("plots/bandwidth_boxplots.png", plot = p_oracle_bandwidth, width = 10, height = 5, dpi = 150)
+```
+
+```{r}
+#| label: sample-size-study
+#| cache: true
+n_values <- c(
+  50,
+  100,
+  500
+)
+B_n <- 50
+sample_size_results_list <- vector(
+  "list",
+  length(n_values)
+)
+for (i in seq_along(n_values)) {
+  set.seed(
+    2000 + i
+  )
+  n_current <- n_values[i]
+  result <- run_simulation(
+    scenario = scenarios$mixture,
+    n = n_current,
+    h_grid = seq(
+      0.05,
+      2,
+      length.out = 40
+    ),
+    B = B_n,
+    repeats = 3
+  )
+  result$scenario <- "Mixture"
+  sample_size_results_list[[i]] <- result
+}
+sample_size_results <- do.call(
+  rbind,
+  sample_size_results_list
+)
+```
+
+
+```{r}
+#| label: sample-size-bandwidth
+#| fig-width: 9
+#| fig-height: 5
+sample_size_results$scenario <- factor(
+  sample_size_results$scenario,
+  levels = c("Normal", "Gamma", "Mixture")
+)
+p_sample_bandwidth <- ggplot(
+  subset(
+    sample_size_results,
+    method != "Oracle"
+  ),
+  aes(
+    x = factor(n),
+    y = bandwidth,
+    fill = method
+  )
+) +
+  geom_boxplot(
+    position = position_dodge(
+      width = 0.8
+    )
+  ) +
+  labs(
+    title = "Bandwidth selection as sample size increases",
+    subtitle = "Gaussian mixture simulation",
+    x = "Sample size",
+    y = "Selected bandwidth",
+    fill = "Method"
+  ) +
+  theme_minimal(base_size = 12)
+print(p_sample_bandwidth)
+ggsave("plots/bandwidth_sample_size_boxplots.png", plot = p_sample_bandwidth, width = 9, height = 5, dpi = 150)
+```
+
+```{r}
+#| label: sample-size-ise
+#| fig-width: 9
+#| fig-height: 5
+p_sample_ise <- ggplot(
+  subset(
+    sample_size_results,
+    method != "Oracle"
+  ),
+  aes(
+    x = factor(n),
+    y = ise,
+    fill = method
+  )
+) +
+  geom_boxplot(
+    position = position_dodge(
+      width = 0.8
+    )
+  ) +
+  labs(
+    title = "Estimation error as sample size increases",
+    subtitle = "Gaussian mixture simulation",
+    x = "Sample size",
+    y = "Integrated squared error",
+    fill = "Method"
+  ) +
+  theme_minimal(base_size = 12)
+print(p_sample_ise)
+#ggsave("plots/ise_sample_size_boxplots.png", plot = p_sample_ise, width = 9, height = 5, dpi = 150)
+```
+
+# Real-data example
+
+The simulation study allows direct evaluation against a known density.
+
+For real data the true density is unavailable, so performance cannot be
+
+measured using ISE.
+
+Instead, the bandwidth selectors are compared visually on the eruption
+
+durations from the `faithful` dataset.
+
+```{r}
+#| label: faithful-data-summary
+x_real <- datasets::faithful$eruptions
+summary(x_real)
+```
+
+```{r}
+#| label: faithful-bandwidths
+h_grid_real <- seq(
+  0.05,
+  1.5,
+  length.out = 80
+)
+set.seed(2026)
+h_amise_real <- amise_bandwidth(
+  x_real
+)
+loglik_real <- repeated_cv_loglik(
+  x = x_real,
+  h_grid = h_grid_real,
+  k = 5,
+  repeats = 10
+)
+lscv_real <- lscv_bandwidth(
+  x = x_real,
+  h_grid = h_grid_real
+)
+bandwidths_real <- c(
+  AMISE = h_amise_real,
+  LogLik_CV = loglik_real$bandwidth,
+  LSCV = lscv_real$bandwidth
+)
+bandwidths_real
+```
+
+```{r}
+#| label: faithful-density-data
+grid_real <- seq(
+  min(x_real) - max(bandwidths_real),
+  max(x_real) + max(bandwidths_real),
+  length.out = 1000
+)
+real_density_data <- do.call(
+  rbind,
+  lapply(
+    names(bandwidths_real),
+    function(method) {
+      data.frame(
+        x = grid_real,
+        density = kde_at(
+          eval_points = grid_real,
+          x = x_real,
+          h = bandwidths_real[[method]]
+        ),
+        method = method
+      )
+    }
+  )
+)
+```
+
+```{r}
+#| label: faithful-density-plot
+#| fig-width: 8
+#| fig-height: 5
+p_faithful <- ggplot() +
+  geom_histogram(
+    data = data.frame(x = x_real),
+    aes(
+      x = x,
+      after_stat(density)
+    ),
+    bins = 25,
+    alpha = 0.2
+  ) +
+  geom_line(
+    data = real_density_data,
+    aes(
+      x = x,
+      y = density,
+      color = method
+    ),
+    linewidth = 1
+  ) +
+  labs(
+    title = "Kernel density estimates for Old Faithful eruption durations",
+    subtitle = paste0(
+      "n = ",
+      length(x_real)
+    ),
+    x = "Eruption duration (minutes)",
+    y = "Density",
+    color = "Bandwidth selector"
+  ) +
+  theme_minimal(
+    base_size = 12
+  ) +
+  theme(
+    legend.position = "bottom"
+  )
+print(p_faithful)
+#ggsave("plots/faithful_density.png", plot = p_faithful, width = 8, height = 5, dpi = 150)
+```
+
+```{r}
+#| label: faithful-bandwidth-table
+data.frame(
+  method = names(bandwidths_real),
+  bandwidth = unname(bandwidths_real)
+)
+```
+
+## Comparison with reference R selectors
+
+```{r}
+#| label: reference-selector-comparison
+selector_comparison <- run_selector_comparison(
+  scenario = scenarios$mixture,
+  B = 50,
+  n = 200,
+  h_grid = seq(
+    0.05,
+    2,
+    length.out = 80
+  ),
+  k = 5,
+  repeats = 3
+)
+```
+
+```{r}
+#| label: reference-selector-plots
+#| fig-width: 11
+#| fig-height: 5
+plot_data <- subset(
+  selector_comparison,
+  method != "Oracle"
+)
+plot_data$source <- ifelse(
+  grepl("^R_", plot_data$method),
+  "R",
+  "Own implementation"
+)
+p_bandwidth <- ggplot(
+  plot_data,
+  aes(
+    x = method,
+    y = bandwidth_ratio,
+    fill = source
+  )
+) +
+  geom_hline(
+    yintercept = 1,
+    linetype = 2
+  ) +
+  geom_boxplot(
+    width = 0.7,
+    outlier.alpha = 0.4
+  ) +
+  labs(
+    title = "Bandwidth selectors compared with the oracle",
+    subtitle = "Gaussian mixture, n = 200, 50 simulations",
+    x = NULL,
+    y = expression(
+      h[selector] / h[oracle]
+    ),
+    fill = NULL
+  ) +
+  theme_minimal(
+    base_size = 12
+  ) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(
+      angle = 25,
+      hjust = 1
+    )
+  )
+p_ise <- ggplot(
+  plot_data,
+  aes(
+    x = method,
+    y = ise_ratio,
+    fill = source
+  )
+) +
+  geom_hline(
+    yintercept = 1,
+    linetype = 2
+  ) +
+  geom_boxplot(
+    width = 0.7,
+    outlier.alpha = 0.4
+  ) +
+  labs(
+    title = "Estimation error relative to the oracle",
+    x = NULL,
+    y = expression(
+      ISE / ISE[oracle]
+    ),
+    fill = NULL
+  ) +
+  theme_minimal(
+    base_size = 12
+  ) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(
+      angle = 25,
+      hjust = 1
+    )
+  )
+p_selector_comparison <- patchwork::wrap_plots(
+  p_bandwidth,
+  p_ise,
+  nrow = 1,
+  guides = "collect"
+) &
+  theme(
+    legend.position = "bottom"
+  )
+print(p_selector_comparison)
+#ggsave("plots/bandwidth_selection.png", plot = p_selector_comparison, width = 11, height = 5, dpi = 150)
+```
