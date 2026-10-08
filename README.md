@@ -4,10 +4,10 @@ This repository contains solutions to the four exam assignments for the course o
 Each project is organized in its own folder:
 
 ```text
-assignment1/
-assignment2/
-assignment3/
-assignment4/
+assignment_1/
+assignment_2/
+assignment_3/
+assignment_4/
 ```
 
 The projects combine statistical methodology with computational implementation, simulation studies, validation, benchmarking, profiling, and comparison with existing R functionality.
