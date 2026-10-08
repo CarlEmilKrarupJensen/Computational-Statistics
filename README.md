@@ -1,4 +1,3 @@
-```markdown
 # Computational-Statistics
 This repository contains solutions to the four exam assignments for the course on Computational Statistics at the University of Copenhagen.
 
@@ -123,7 +122,7 @@ The projects are primarily implemented in R and use tools such as:
 - `ggplot2` for visualization.
 
 The emphasis throughout the repository is not only on obtaining statistically correct results, but also on understanding the computational cost and trade-offs of different implementations.
-```
+
 
 
 
