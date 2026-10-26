@@ -1,0 +1,359 @@
+---
+title: "Assignment B — Gradient methods for dose-response curves"
+subtitle: "Numerical accuracy, momentum, learning rates and local conditioning"
+---
+
+# Scope and setup
+
+We compare full-gradient and single-observation gradient methods for nonlinear
+least squares. The main question is when momentum or adaptive scaling helps,
+and how that depends on starting values, step sizes, local geometry and N.
+Newton is excluded from the method comparison. An independent multi-start BFGS
+calculation supplies a numerical reference; it is not a competing timed method.
+
+Open `assignment_4.Rproj` and render this document. All settings and experiment
+runners are in `project_B/experiments.R`. The [performance report](dose_response_performance.html)
+uses the same main cases and geometry experiments. Timings are measured afresh;
+seeded data and optimization paths are reproducible, wall times are not identical.
+Source only project B's helpers in the R session.
+
+```{r}
+#| label: setup
+#| include: false
+source("project_B/model.R")
+source("project_B/data.R")
+source("project_B/solvers.R")
+source("project_B/experiments.R")
+source("project_B/plots.R")
+library(ggplot2)
+settings <- study_settings()
+settings$batch_size <- 16
+cases <- study_data(settings)
+grid_data <- cases[["grid_300"]]
+problem <- grid_data$problem
+```
+
+# Model and simulated data
+
+For $z=\log(x)$, let $q=\operatorname{logistic}(\alpha-\beta z)$ and
+$$f(x;\theta)=\gamma+(\delta-\gamma)q,\qquad
+Y_i=f(x_i;\theta_{\mathrm{true}})+\varepsilon_i,\quad
+\varepsilon_i\sim N(0,0.1^2).$$
+We minimize the **mean** squared error,
+$$H(\theta)=\frac1N\sum_i(f_i-y_i)^2.$$
+
+| Main design | Log-doses | True $(\alpha,\beta,\gamma,\delta)$ | Common start |
+|---|---|---|---|
+| Grid | Balanced repetitions of $1,\ldots,15$ | $(8,1,0.2,1.2)$ | $(6,0.8,0.1,1.3)$ |
+| Continuous | Independent $N(0,2^2)$ values | $(0,1.2,0.2,1.2)$ | $(-0.5,0.8,0.1,1.3)$ |
+
+For each design, generate N = 15,000 once with seed 2026, then use the first 300
+observations for the smaller sample. All methods receive the same data and start
+within a case. Grid points are repeated deterministically; response noise is random.
+Continuous doses are almost surely distinct. The designs also have different true
+parameters, so comparing them does not isolate dose placement alone.
+
+The plateau parameters are gamma and delta; `gamma0` denotes a learning rate.
+The midpoint of the curve is at $z=\alpha/\beta$. The symmetry
+$(\alpha,\beta,\gamma,\delta)\mapsto(-\alpha,-\beta,\delta,\gamma)$ leaves the curve
+unchanged, so compare objectives and curves before interpreting parameter differences.
+
+# Gradient and geometry
+
+Let $D=\delta-\gamma$, $w_i=q_i(1-q_i)$ and $r_i=f_i-y_i$. Then
+$$J_i=\nabla f_i=(Dw_i,-Dz_iw_i,1-q_i,q_i)^T,$$
+$$\nabla H=\frac2N\sum_i r_iJ_i,\qquad
+\nabla^2H=\frac2N\sum_i[J_iJ_i^T+r_i\nabla^2f_i].$$
+The residual term can make the Hessian indefinite. This objective is generally
+nonconvex: small gradients establish approximate stationarity, not a global optimum.
+The Hessian remains in the project for derivative tests and geometry diagnostics;
+none of the compared methods uses it for an update.
+
+# Methods and step-size rules
+
+| Label | Gradient information | Step rule |
+|---|---|---|
+| Full GD: Armijo | All N observations | Armijo backtracking |
+| Full Polyak: Armijo | All N observations, gradient averaging | Armijo with restart safeguard |
+| Full Nesterov: Armijo | All N observations at a look-ahead point | Armijo with restart safeguard |
+| Full GD: decay | One batch containing all N observations | Power-law schedule |
+| SGD | One observation per update | Power-law schedule |
+| Stochastic Polyak | One observation, gradient averaging | Power-law schedule |
+| Stochastic Nesterov | One observation at a look-ahead point | Power-law schedule |
+| AdaGrad | One observation per update | Fixed base rate, coordinate adaptation |
+
+Ordinary deterministic GD is already a full-batch method. The additional **Full GD:
+decay** control separates the scheduled full-gradient implementation from Armijo GD.
+It makes only one update per epoch, whereas SGD makes N. Thus their equal-pass
+comparison changes both gradient noise and the number of updates; it is not a pure
+experiment on noise alone.
+
+For stochastic algorithms, each epoch randomly permutes the observations and visits
+each once. Batch size is one. Momentum state persists between epochs. With
+$g_t$ denoting the appropriate full or individual gradient, Polyak uses the course's
+averaging convention:
+$$\rho_t=m\rho_{t-1}+(1-m)g_t,\qquad
+\theta_t=\theta_{t-1}-\eta_t\rho_t,\quad \rho_0=0.$$
+Nesterov first extrapolates:
+$$u_t=\theta_{t-1}+m(\theta_{t-1}-\theta_{t-2}),\qquad
+\theta_t=u_t-\eta_t g_t(u_t).$$
+We use $m=0.9$, with the first displacement zero. These are not claims of the
+optimal convex accelerated rate for this nonconvex stochastic problem.
+
+For the scheduled methods, completed epochs $e=0,1,\ldots$ determine
+$$\eta_e=\frac{\eta_0K}{K+e^{0.75}},\qquad K=5^{0.75}.$$
+The initial rate is 0.01 and halves after five completed epochs. It remains constant
+within an epoch. AdaGrad instead keeps its base rate at 0.01 and updates elementwise:
+$$s_t=s_{t-1}+g_t^2,\qquad
+\theta_t=\theta_{t-1}-0.01\,\frac{g_t}{\sqrt{s_t+10^{-8}}}.$$
+Its effective coordinate rates decrease without another decay schedule.
+
+## Armijo and deterministic momentum safeguards
+
+Given a base point $b$ and descent direction $d$, halve the trial step from 1 until
+$$H(b+\eta d)\le H(b)+10^{-4}\eta\nabla H(b)^Td.$$
+The trial step resets on every iteration. All three full-gradient Armijo methods
+share this rule, a 2,000-update budget and gradient infinity-norm tolerance $10^{-8}$.
+
+For GD and Polyak the base point is the current iterate. If Polyak's averaged
+gradient points uphill, reset its memory before searching. For Nesterov, apply
+Armijo at the look-ahead point, then additionally require that the result does not
+increase the objective relative to the current iterate. If it does, discard the
+extrapolation and take an Armijo GD step; reset the next displacement to zero.
+A failed momentum search also retries as GD. Failure of that search is reported.
+
+These are explicitly **safeguarded momentum variants**, rather than the unmodified
+fixed-step course algorithms. Restarts are reported: frequent restarts indicate
+that the momentum proposal was often unhelpful. Sharing controls makes comparisons
+transparent, but does not make methods equally tuned or their per-update costs equal.
+
+# Correctness checks
+
+```{r}
+#| label: tests
+testthat::test_dir("tests/project_B", reporter = "summary", stop_on_failure = TRUE)
+```
+
+The readable tests check numerical derivatives, exact grouping, individual-gradient
+averaging, the course's SGD loop, agreement with independent nonlinear least squares,
+non-increasing accepted deterministic losses, the first momentum updates without
+restarts, full-batch gradient scaling, and equality of R/C++ gradients. These tests
+check implementations; they do not prove global convergence.
+
+# Two-dimensional trajectories
+
+Fix gamma and delta at their true grid values and vary alpha and beta, from the same
+two starts for every method. The star is a conditional multi-start BFGS reference.
+Circles mark starts, triangles last recorded points. These are 15-epoch stochastic
+runs and at most 2,000 Armijo updates. Paths connect recorded iterates, not time.
+The rate shown applies to scheduled methods and AdaGrad; Armijo trial steps stay at 1.
+
+```{r}
+#| label: slice
+#| fig-width: 13
+#| fig-height: 11
+plot_slice(problem, fixed = grid_data$truth,
+           starts = rbind(c(6, 0.6), c(10, 1.4)), gamma0 = 0.05)
+```
+
+```{r}
+#| label: slice-larger-rate
+#| fig-width: 13
+#| fig-height: 11
+plot_slice(problem, fixed = grid_data$truth,
+           starts = rbind(c(6, 0.6), c(10, 1.4)), gamma0 = 0.1)
+```
+
+The third dimension is log10(MSE). It reveals small loss differences but changes
+apparent curvature: it cannot be used to read off a condition number. Blue and orange
+identify the two starts. Trajectories are drawn over the surface for visibility.
+
+```{r}
+#| label: slice-surface
+#| fig-width: 13
+#| fig-height: 11
+plot_slice(problem, grid_data$truth, rbind(c(6, 0.6), c(10, 1.4)),
+           gamma0 = 0.05, view = "surface")
+```
+
+```{r}
+#| label: slice-surface-larger-rate
+#| fig-width: 13
+#| fig-height: 11
+plot_slice(problem, grid_data$truth, rbind(c(6, 0.6), c(10, 1.4)),
+           gamma0 = 0.1, view = "surface")
+```
+
+Look for progress across versus along the valley. Alpha and beta can partly compensate
+through their ratio. Stochastic updates need not reduce the full MSE; momentum can
+help sustained movement but also overshoot. The full-gradient variants illustrate
+how much of the oscillation depends on sampling and how much the safeguards remove.
+
+# Main comparison: small and large N
+
+Every stochastic run gets 15 epochs, using shuffle seeds 201 and 202. These vary
+optimization order, not the simulated dataset. Full GD with decay is run once;
+reshuffling a full batch changes only floating-point summation. Full MSE monitoring
+occurs every quarter epoch where possible and is included in elapsed time. Full-batch
+scheduled GD can only record once per epoch because there is only one update.
+
+Report the final MSE, status and first recorded time within $10^{-4}$ of the
+best-found reference. NA means no recorded attainment within budget, not missing
+failure data. First attainment does not imply remaining below the target. Small
+negative reference differences remain visible and would warrant a better reference
+search. The reference is not a certified global optimum.
+
+```{r}
+#| label: main-study
+results <- run_study(settings)
+comparison <- study_summary(results, settings)
+main_rows <- comparison[!startsWith(comparison$run, "grouped_"), ]
+knitr::kable(main_rows[, c("design", "N", "method", "seed", "status", "updates", "objective",
+                         "seconds", "seconds_to_target", "restarts")],
+             digits = 6, row.names = FALSE)
+```
+
+```{r}
+#| label: main-convergence
+#| fig-width: 12
+#| fig-height: 10
+plot_study(results)
+```
+
+```{r}
+#| label: small-sample-detail
+#| fig-width: 12
+#| fig-height: 6
+plot_study(results[c("grid_300", "continuous_300")])
+```
+
+Each panel has its own time scale and a shared MSE scale. Compare the numerical
+time-axis labels rather than horizontal distances across panels.
+
+Increasing N gives more stochastic updates per epoch, but also more work. Compare
+wall time rather than iteration counts. A similar order of MSE is not equal accuracy;
+near the noise variance 0.01, the reference differences and target times are useful.
+A method stopping at its budget has not necessarily converged. Short timings are
+limited by timer resolution; repeated computational benchmarks follow in the other report.
+
+## Fitted and generating curves
+
+```{r}
+#| label: fitted-curves
+#| fig-width: 10
+#| fig-height: 6
+for (name in names(results)) {
+  case <- results[[name]]
+  selected <- c("full_gd", "full_polyak", "full_nesterov", "full_decay",
+                "sgd_201", "polyak_201", "nesterov_201", "adagrad_201")
+  print(plot_curves(case$dataset, case$fits[selected]) + ggtitle(name))
+}
+```
+
+The dashed black line is the generating curve; at most 1,500 observations are plotted,
+although every observation is used in fitting. Display seed 201 for stochastic curves;
+both seeds remain in the convergence comparison.
+
+# One factor at a time: starting values
+
+Keep N = 300, the grid data and all controls fixed. Use a near-truth start
+$(7.5,0.9,0.15,1.25)$, the baseline $(6,0.8,0.1,1.3)$ and a saturated start
+$(20, 2, 0.5, 2.3)$. These intentionally probe favorable and difficult initializations;
+the near-truth case uses knowledge available only in simulation. Compare all methods,
+including runs that fail to reach the reference.
+
+```{r}
+#| label: start-sensitivity
+#| results: asis
+#| fig-width: 10
+#| fig-height: 6
+start_results <- run_sensitivity(settings, "starts")
+for (name in names(start_results)) {
+  case <- start_results[[name]]
+  print(knitr::kable(fit_summary(case$fits, case$dataset$problem, case$reference),
+                     digits = 6, row.names = FALSE, caption = name))
+  print(plot_convergence(case$fits, case$reference) + ggtitle(name))
+}
+```
+
+# One factor at a time: step sizes
+
+First vary only the scheduled/AdaGrad initial rate: 0.001, 0.01, 0.05. Keep starts,
+data, seeds, momentum and decay half-time fixed. AdaGrad still uses a fixed base rate.
+Then vary only the Armijo trial step: 0.1, 1, 5, keeping c fixed. Armijo can shorten
+an excessive trial step, at the cost of extra objective evaluations. These are
+separate experiments because a trial step and a scheduled rate play different roles.
+
+```{r}
+#| label: rate-sensitivity
+#| results: asis
+#| fig-width: 10
+#| fig-height: 6
+for (experiment in c("stochastic_rate", "armijo_step")) {
+  rate_results <- run_sensitivity(settings, experiment)
+  for (name in names(rate_results)) {
+    case <- rate_results[[name]]
+    print(knitr::kable(fit_summary(case$fits, case$dataset$problem, case$reference),
+                       digits = 6, row.names = FALSE, caption = name))
+    print(plot_convergence(case$fits, case$reference) + ggtitle(name))
+  }
+}
+```
+
+# One factor at a time: underlying slope and local conditioning
+
+Use 1,500 identical continuous log-doses and the same noise realization for all three
+cases. Keep alpha = 0, gamma = 0.2 and delta = 1.2, but set the true beta to
+0.35, 1.2 or 4. A shallow sigmoid can appear almost linear over the sampled range;
+a steep sigmoid concentrates information near its transition. Both can weaken
+identification in some directions. We measure rather than presume the outcome.
+
+All methods use the same continuous-design start and controls. Changing the true
+slope also changes the start's distance to the solution, so this is a geometry
+stress test, not a perfectly isolated experiment on a single condition number.
+
+The table shows exact Hessian eigenvalues and, when positive definite, their ratio.
+It also shows the eigenvalue ratio of $2J^TWJ$, with $W=I/N$, a positive-semidefinite
+local curvature diagnostic. At the generating parameters this is the conditional
+expected Hessian over response noise. Neither number is a global $L/\mu$ bound.
+Condition numbers depend on parameter units; units are unchanged across these cases.
+NA indicates an exact Hessian that is not positive definite; Inf indicates numerical
+singularity under the diagnostic threshold.
+
+```{r}
+#| label: geometry
+#| results: asis
+#| fig-width: 10
+#| fig-height: 6
+geometry_results <- run_sensitivity(settings, "geometry")
+knitr::kable(geometry_summary(geometry_results), digits = 4, row.names = FALSE)
+for (name in names(geometry_results)) {
+  case <- geometry_results[[name]]
+  print(knitr::kable(fit_summary(case$fits, case$dataset$problem, case$reference),
+                     digits = 6, row.names = FALSE, caption = name))
+  print(plot_convergence(case$fits, case$reference) + ggtitle(name))
+  selected <- c("full_gd", "full_polyak", "full_nesterov", "full_decay",
+                "sgd_201", "polyak_201", "nesterov_201", "adagrad_201")
+  print(plot_curves(case$dataset, case$fits[selected]) + ggtitle(name))
+}
+```
+
+For this seed, the exact Hessian condition numbers at the numerical references
+are approximately 493, 103 and 970 for slopes 0.35, 1.2 and 4, respectively.
+The middle slope is locally better conditioned in these parameter units. This
+supports the intended geometry contrast without asserting a global ordering of
+optimization difficulty.
+
+Relate slow loss reduction to local geometry, then inspect whether momentum helps
+and whether it triggers restarts or oscillations. AdaGrad scales coordinates using
+gradient history, not the Hessian; it need not correct a rotated narrow valley.
+Do not select a favorable run as proof that a method is generally superior.
+
+# Link to computation
+
+The performance report uses the same sample-size and geometry experiments. It
+compares achieved accuracy with elapsed time, explains costs of full versus individual
+gradients, measures line-search work, and benchmarks exact grid compression. Grouping
+changes evaluation cost without changing the objective. Profiling and Rcpp then
+identify potential implementation improvements. Mini-batches remain an extension;
+the main stochastic comparisons use one observation per update.
