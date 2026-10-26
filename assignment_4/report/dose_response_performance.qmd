@@ -1,0 +1,744 @@
+---
+title: "Assignment B — Computational comparison of gradient methods"
+subtitle: "Accuracy, sample size, momentum costs and repeated-dose compression"
+---
+
+# A shared numerical and computational study
+
+This report uses the same `study_settings()`, `run_study()` and geometry experiment
+as the [simulation report](dose_response_simulation.html). Starts, data, seeds and
+controls match; timings are fresh measurements. Newton is excluded. Multi-start
+BFGS is used only for a best-found numerical reference, not as a timed competitor.
+
+Compare full-gradient GD, Polyak and Nesterov with safeguarded Armijo searches;
+full-gradient GD with power-law decay; mini-batch SGD, Polyak and Nesterov
+with that decay; and mini-batch AdaGrad with a fixed base rate. These are
+comparisons of implementations and step policies under shared, non-optimal tuning.
+
+```{r}
+#| label: setup
+#| include: false
+source("project_B/model.R")
+source("project_B/data.R")
+source("project_B/solvers.R")
+source("project_B/experiments.R")
+source("project_B/plots.R")
+library(ggplot2)
+# Match the current simulation QMD override. Edit this in both reports together.
+settings <- study_settings()
+settings$batch_size <- 16
+results <- run_study(settings)
+comparison <- study_summary(results, settings)
+large <- results[["grid_15000"]]$dataset$problem
+theta <- results[["grid_15000"]]$start
+```
+
+# Accuracy against time
+
+The stochastic budget is `r settings$epochs` epochs with batch size
+`r settings$batch_size` and initial rate `r settings$gamma0`.
+Scheduled rates use exponent `r settings$a` and half-time `r settings$half_epochs`
+epochs; AdaGrad keeps its base rate fixed. Momentum is 0.9. Armijo methods share trial step 1, c = 0.0001, halving,
+at most 2,000 updates, and gradient infinity-norm tolerance 1e-8.
+
+Equal epochs are equal passes, not equal updates. Full-batch scheduled GD takes 15
+updates; mini-batch SGD takes $15\lceil N/b\rceil$. Armijo methods may use additional passes
+for line search. Report accuracy against wall time and first recorded time within
+0.0001 MSE of the best-found reference. NA means no recorded attainment within
+budget. First attainment does not imply sustained accuracy. This is not a global
+optimality certificate; negative reference differences would prompt further search.
+
+Full-MSE monitoring is included in traces, every quarter epoch where possible.
+Full-batch scheduled GD can record only once per epoch. Data generation and reference
+search are excluded. Execute benchmarks sequentially to avoid CPU contention.
+
+```{r}
+#| label: main-summary
+main_rows <- comparison[!startsWith(comparison$run, "grouped_"), ]
+knitr::kable(main_rows[, c("design", "N", "method", "seed", "status", "updates", "objective",
+                         "seconds", "seconds_to_target", "restarts")],
+             digits = 6, row.names = FALSE)
+```
+
+```{r}
+#| label: main-convergence
+#| fig-width: 12
+#| fig-height: 10
+plot_study(results)
+```
+
+```{r}
+#| label: small-detail
+#| fig-width: 12
+#| fig-height: 6
+plot_study(results[c("grid_300", "continuous_300")])
+```
+
+Each panel has its own time scale and a shared MSE scale. Compare the numerical
+time-axis labels, not horizontal distances across panels. The small-sample view
+provides more space for inspecting those trajectories. These are two shuffle replicates on fixed datasets, not repeated
+simulations establishing a universal ranking. Short times have limited clock resolution.
+
+# Which method reaches the requested accuracy first?
+
+An algorithm can be useful at a loose accuracy requirement but become expensive at
+a strict one. The following heatmap compares three requirements on the **same**
+recorded trajectories. Each cell labels how many runs reached the threshold; its
+color shows the median first-attainment time among those runs. Grey means no
+attainment within budget, not that the method would never reach the target.
+A 1/2 cell is not directly comparable in reliability to a 2/2 cell. Deterministic
+methods have one run, so 1/1 is not evidence of robustness over datasets.
+
+```{r}
+#| label: accuracy-target-map
+#| fig-width: 12
+#| fig-height: 9
+targets <- accuracy_targets(results)
+plot_accuracy_targets(targets)
+```
+
+Read this with the final-error tables: an oscillating stochastic method may cross a
+target briefly and then finish above it. These are first **recorded** crossings;
+checkpoint spacing and millisecond timer resolution limit precision. The reference
+is best-found, not a proven lower bound. Thus the target measures closeness to a
+numerical reference, not a certified global optimization error.
+
+This directly addresses the trade-off: noisy inexpensive updates may provide a
+useful approximation quickly, whereas full-gradient methods can offer steadier
+refinement. Whether that happens here is determined by the colored cells and
+attainment labels, not assumed from the algorithm names.
+
+# Cost per update versus number of updates
+
+With p = 4 parameters, an individual gradient costs O(p), a full gradient O(Np),
+and a full objective O(N). An epoch of single-observation updates costs O(Np),
+plus shuffling and monitoring. A full-gradient update is more expensive but can
+make more reliable progress. Vectorized R evaluation also avoids the repeated
+function calls and small allocations in a single-observation loop.
+
+Polyak stores a p-vector and adds O(p) work per update. Nesterov uses a look-ahead
+gradient; our deterministic version also checks the current gradient for stopping
+and may restart. AdaGrad stores p squared-gradient accumulators and adapts coordinates
+in O(p). Backtracking costs extra objective evaluations. These costs must be considered
+alongside the number of updates needed to obtain an adequate fit.
+
+```{r}
+#| label: line-search-work
+work <- data.frame()
+for (name in names(results)) {
+  for (method in c("full_gd", "full_polyak", "full_nesterov")) {
+    fit <- results[[name]]$fits[[method]]
+    work <- rbind(work, data.frame(case = name, method = fit$method,
+      updates = tail(fit$history$update, 1), restarts = fit$restarts,
+      objective_evaluations = fit$objective_evaluations,
+      gradient_evaluations = fit$gradient_evaluations))
+  }
+}
+knitr::kable(work, row.names = FALSE)
+```
+
+Objective counts include initialization, line-search trials and Nesterov look-ahead
+checks. Gradient counts cover current and look-ahead gradients within the optimization
+loop. The final stationarity check and summary calculations are outside these loop
+counts. Restarts are part of the cost. The simulation report separately varies the
+trial step while keeping Armijo c fixed.
+
+# Batch size: speed, final error and progress per pass
+
+Use the large grid and continuous datasets already fitted above, with batch sizes
+1, 16, 64 and 256. Compare all four stochastic methods using the same starts,
+seeds, initial rate, momentum and 15-epoch budget. Only batch size changes. The final
+partial batch is averaged over its actual size. The settings below are editable.
+This is an equal-pass experiment, not an equal-update or equal-time experiment.
+
+```{r}
+#| label: batch-study
+batch_sizes <- c(1, 16, 64, 256)
+batch_results <- run_batch_study(
+  results[c("grid_15000", "continuous_15000")], settings, batches = batch_sizes
+)
+knitr::kable(batch_results$summary[, c("case", "method", "seed", "batch", "status",
+  "updates", "objective", "difference_from_reference", "seconds", "seconds_to_target")],
+  digits = 6, row.names = FALSE)
+```
+
+```{r}
+#| label: batch-tradeoff
+#| fig-width: 12
+#| fig-height: 11
+plot_batch_tradeoff(batch_results, accuracy = settings$accuracy)
+```
+
+Each point is one run. Lower-left means a smaller final error in less total time.
+Filled points indicate that the target was reached at least once, not necessarily
+maintained. Signed differences remain in the table; the log plot uses a display
+floor of 1e-8. Both seeds are shown even if their points overlap.
+
+Now compare progress per pass through the observations, removing wall-clock speed
+from the horizontal axis. This distinguishes an implementation saving from more
+progress for the same amount of data processed.
+
+```{r}
+#| label: batch-passes
+#| fig-width: 12
+#| fig-height: 11
+traces <- batch_results$traces
+ggplot(traces, aes(passes, pmax(reference_difference, 1e-8),
+                  color = factor(batch), group = interaction(batch, seed))) +
+  geom_line(alpha = 0.7) +
+  geom_hline(yintercept = settings$accuracy, linetype = "dashed") +
+  facet_grid(method ~ case) + scale_y_log10() + theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = "Passes through the observations", color = "Batch size",
+       y = "MSE minus reference (display floor: 1e-8)")
+```
+
+Increasing b makes each gradient more expensive, but reduces the number of R calls
+and updates per epoch to approximately N/b. It usually reduces sampling noise at a
+fixed parameter, but fewer updates can leave more error after 15 passes. The decay
+schedule still changes by epoch, so larger batches get fewer updates before each
+rate reduction. AdaGrad also accumulates a different gradient history.
+
+The best batch size therefore depends on the method, accuracy requirement and
+implementation. Because the rates are held fixed, this experiment measures
+sensitivity rather than the best possible performance of every batch size.
+The stochastic runs use original observations; grid grouping is a separate exact
+full-gradient shortcut examined below.
+
+# Local geometry changes the required effort
+
+Repeat the simulation report's slopes 0.35, 1.2 and 4 on the same 1,500 continuous
+doses and noise realization. Keep plateaus, center, common start and controls fixed.
+Each evaluation has similar cost, while progress can differ because the geometry
+and distance from the shared start change.
+
+```{r}
+#| label: geometry-cost
+#| results: asis
+#| fig-width: 10
+#| fig-height: 6
+geometry_results <- run_sensitivity(settings, "geometry")
+knitr::kable(geometry_summary(geometry_results), digits = 4, row.names = FALSE)
+for (name in names(geometry_results)) {
+  case <- geometry_results[[name]]
+  print(knitr::kable(fit_summary(case$fits, case$dataset$problem, case$reference),
+                     digits = 6, row.names = FALSE, caption = name))
+  print(plot_convergence(case$fits, case$reference) + ggtitle(name))
+}
+```
+
+The exact Hessian ratio is reported only when positive definite; the Jacobian
+curvature ratio is a positive-semidefinite diagnostic. Both are local and depend
+on parameter units. Neither establishes global strong convexity. See the fitted
+curves in the simulation report for the consequences of remaining optimization error.
+
+# Exploit repeated doses without changing the objective
+
+For each distinct dose retain its count $n_j$, response mean $\bar y_j$ and
+within-dose sum of squares $S_j$. Then
+$$H(\theta)=\frac1N\sum_j[S_j+n_j(\bar y_j-f(x_j;\theta))^2].$$
+The cross term vanishes because deviations from a group mean sum to zero. The
+within-dose term is parameter-independent but retained for comparable MSE values.
+Gradients require only weighted dose means.
+
+For a known 15-point grid, summaries can be accumulated in one pass; subsequent
+evaluations depend on 15 groups rather than N. The generic helper also identifies
+and orders distinct doses, so we measure preprocessing. Grouping is exact, not
+rounding or binning. Continuous doses are almost surely distinct and offer no useful
+compression. Full-gradient momentum can use the same exact summaries. Stochastic
+methods keep the original observations: replacing individual responses by means
+would change their updates and noise.
+
+```{r}
+#| label: grouping-check
+preprocessing <- system.time(grouped <- group_doses(large))[["elapsed"]]
+data.frame(N = large$N, groups = length(grouped$z), preprocessing_seconds = preprocessing)
+stopifnot(isTRUE(all.equal(objective(theta, large), objective(theta, grouped))))
+stopifnot(isTRUE(all.equal(gradient(theta, large), gradient(theta, grouped))))
+```
+
+```{r}
+#| label: grouped-results
+grid_rows <- comparison[comparison$design == "grid" &
+                         (startsWith(comparison$run, "grouped_") |
+                          comparison$run %in% c("full_gd", "full_polyak", "full_nesterov")), ]
+knitr::kable(grid_rows[, c("N", "method", "status", "objective", "seconds",
+                         "seconds_to_target", "restarts")], digits = 6, row.names = FALSE)
+```
+
+```{r}
+#| label: grouped-convergence
+#| fig-width: 12
+#| fig-height: 8
+plot_study(results[c("grid_300", "grid_15000")], include_grouped = TRUE)
+```
+
+Each grouped trace includes preprocessing. Starts and controls match, and summaries
+are evaluated against the original observations. Floating-point summation can change
+a line-search decision near a threshold; the mathematical problem is identical.
+A speedup exploits data structure, not different statistical accuracy or convexity.
+
+# Repeated benchmarks
+
+Equivalent kernel benchmarks retain equality checking. They exclude preprocessing;
+the end-to-end comparisons below include it every time. Memory allocation is not
+peak resident memory.
+
+```{r}
+#| label: kernels
+bench::mark(raw = objective(theta, large), grouped = objective(theta, grouped),
+             check = TRUE, min_iterations = 30)
+bench::mark(raw = gradient(theta, large), grouped = gradient(theta, grouped),
+             check = TRUE, min_iterations = 30)
+```
+
+```{r}
+#| label: scaling
+scaling <- data.frame()
+for (name in c("grid_300", "grid_15000")) {
+  case <- results[[name]]
+  p <- case$dataset$problem
+  start <- case$start
+  compressed <- group_doses(p)
+  timings <- bench::mark(
+    raw_gradient = gradient(start, p),
+    grouped_gradient = gradient(start, compressed),
+    grouping = group_doses(p), check = FALSE, min_iterations = 30)
+  scaling <- rbind(scaling, data.frame(N = p$N,
+    operation = as.character(timings$expression), seconds = as.numeric(timings$median),
+    bytes = as.numeric(timings$mem_alloc)))
+}
+knitr::kable(scaling, digits = 7, row.names = FALSE)
+ggplot(scaling, aes(N, seconds, color = operation)) + geom_line() + geom_point() +
+  scale_x_log10() + scale_y_log10() + theme_minimal() +
+  labs(x = "Number of observations", y = "Median seconds per operation")
+```
+
+Only the mixed benchmark disables checking because a grouped data object is not a
+gradient. Equality is verified separately. Complete solver benchmarks include garbage
+collection: allocation costs are part of performance.
+
+```{r}
+#| label: end-to-end
+solver_samples <- data.frame()
+for (name in c("grid_300", "grid_15000")) {
+  case <- results[[name]]
+  p <- case$dataset$problem
+  start <- case$start
+  for (method in c("full_gd", "full_polyak", "full_nesterov")) {
+    cat(name, method, "\n")
+    timings <- bench::mark(
+      raw = {
+        fit <- study_fit(p, method, start, settings)
+        objective(fit$theta, p)
+      },
+      grouped = {
+        compressed <- group_doses(p)
+        fit <- study_fit(compressed, method, start, settings)
+        objective(fit$theta, p)
+      },
+      check = TRUE, iterations = 5, filter_gc = FALSE
+    )
+    print(timings)
+    samples <- benchmark_samples(timings)
+    samples$case <- name
+    samples$method <- unname(method_labels()[method])
+    solver_samples <- rbind(solver_samples, samples)
+  }
+}
+```
+
+Both expressions return the final original-data MSE. Five repetitions are illustrative;
+use more for precise estimates. If equality fails, investigate numerical paths rather
+than silently disabling the check. Consult the accuracy table before treating a
+shorter budget-exhausted run as a faster solution.
+
+## Distribution of complete solver timings
+
+The beeswarm shows every timed repetition, including garbage collection. Black
+bars mark medians. Grouped timings include preprocessing on every repetition.
+These repeated durations measure system variability for the same computation;
+they are not independent simulated datasets or shuffle seeds.
+
+```{r}
+#| label: solver-beeswarm
+#| fig-width: 11
+#| fig-height: 9
+ggplot(solver_samples, aes(implementation, seconds, color = implementation)) +
+  ggbeeswarm::geom_quasirandom(width = 0.2, size = 2) +
+  stat_summary(fun = median, geom = "point", shape = 95, size = 8, color = "black") +
+  facet_grid(method ~ case) + scale_y_log10() + theme_minimal() +
+  theme(legend.position = "none") +
+  labs(x = NULL, y = "Seconds per complete fit (log scale)")
+```
+
+# Profile the loop at different batch sizes
+
+Profile plain SGD at batches 1, 16 and 256 using the same large grid data. Repeat
+each calculation for at least one second of profiling so a very short batched run
+still yields enough samples. Each repetition resets the same seed. Profiling is
+separate from the timing experiments because instrumentation adds overhead.
+
+```{r}
+#| label: profiling
+#| fig-width: 9
+#| fig-height: 8
+profile_rows <- data.frame()
+for (batch in c(1, 16, 256)) {
+  controls <- settings
+  controls$batch_size <- batch
+  profile_file <- tempfile()
+  started <- proc.time()[["elapsed"]]
+  Rprof(profile_file, interval = 0.001)
+  tryCatch({
+    repeat {
+      invisible(study_fit(large, "sgd", theta, controls, seed = 201))
+      if (proc.time()[["elapsed"]] - started >= 1) break
+    }
+  }, finally = Rprof(NULL))
+  profile <- summaryRprof(profile_file)
+  top <- head(profile$by.self, 10)
+  profile_rows <- rbind(profile_rows, data.frame(batch = batch,
+    function_name = gsub('"', '', rownames(top)), self_percent = top$self.pct))
+  unlink(profile_file)
+}
+ggplot(profile_rows, aes(self_percent, reorder(function_name, self_percent))) +
+  geom_col(fill = "#4477AA") + facet_wrap(~batch, ncol = 1, scales = "free_y") +
+  theme_minimal() + labs(x = "Percent of sampled time spent directly in function",
+                         y = NULL, subtitle = "Top 10 self-time contributors; panels show batch size")
+```
+
+Self time excludes callees, avoiding the double-counting that would occur if nested
+total times were added together. The top ten functions need not sum to 100 percent.
+These are sampled proportions, not repeated timing distributions, so a bar plot is
+more appropriate here than a beeswarm. Inspect how gradient construction, loop
+work, allocations and monitoring change with batch size. Small gradients may be
+cheap individually yet expensive when called hundreds of thousands of times.
+
+```{r}
+#| eval: false
+profvis::profvis(study_fit(large, "sgd", theta, settings, seed = 201))
+```
+
+## Check the cost of monitoring
+
+Clock calls can appear prominently in the profile when updates are cheap. The
+profile includes a small amount of timing in the repetition wrapper as well as
+inside the solver, so use this separate benchmark to assess actual monitoring cost.
+At batch size 256, change only recording frequency: every quarter epoch, every
+epoch or every five epochs. Each run still performs the same updates with the same
+seed. Equality checking compares the **final parameter vectors**, not just rounded
+losses. Reduced monitoring makes target-attainment times less precisely observed,
+so it is not a free improvement to the main accuracy comparison.
+
+```{r}
+#| label: monitoring-cost
+#| fig-width: 9
+#| fig-height: 5
+quarter <- settings
+quarter$batch_size <- 256
+quarter$monitor_epochs <- 0.25
+every_epoch <- quarter
+every_epoch$monitor_epochs <- 1
+every_five <- quarter
+every_five$monitor_epochs <- 5
+monitor_timings <- bench::mark(
+  quarter_epoch = study_fit(large, "sgd", theta, quarter, seed = 201)$theta,
+  every_epoch = study_fit(large, "sgd", theta, every_epoch, seed = 201)$theta,
+  every_five_epochs = study_fit(large, "sgd", theta, every_five, seed = 201)$theta,
+  check = TRUE, iterations = 10, filter_gc = FALSE
+)
+monitor_timings
+monitor_samples <- benchmark_samples(monitor_timings)
+ggplot(monitor_samples, aes(implementation, seconds * 1000, color = implementation)) +
+  ggbeeswarm::geom_quasirandom(width = 0.2, size = 2) +
+  stat_summary(fun = median, geom = "point", shape = 95, size = 8, color = "black") +
+  theme_minimal() + theme(legend.position = "none") +
+  labs(x = "Recording frequency", y = "Milliseconds per complete SGD run")
+```
+
+# R versus Rcpp: timing distributions and allocation
+
+C++ accumulates four derivatives directly instead of constructing a response-gradient
+matrix. Benchmark batches 1, 16, 64, 256 and full N, using identical precomputed
+indices for R and C++. Equality checking stays enabled. Compilation and sampling
+are excluded. Each beeswarm contains 200 repeated evaluations, including GC events.
+
+```{r}
+#| label: cpp
+Rcpp::sourceCpp("project_B/gradient.cpp")
+cpp_samples <- data.frame()
+cpp_summary <- data.frame()
+for (batch in c(1, 16, 64, 256, large$N)) {
+  index <- seq_len(batch)
+  timings <- bench::mark(R = gradient(theta, large, index),
+    Rcpp = dose_gradient_cpp(theta, large$z, large$y, index),
+    check = TRUE, iterations = 200, filter_gc = FALSE)
+  samples <- benchmark_samples(timings)
+  samples$batch <- batch
+  cpp_samples <- rbind(cpp_samples, samples)
+  cpp_summary <- rbind(cpp_summary, data.frame(batch = batch,
+    implementation = as.character(timings$expression),
+    median_seconds = as.numeric(timings$median), bytes = as.numeric(timings$mem_alloc)))
+}
+knitr::kable(cpp_summary, digits = 8, row.names = FALSE)
+```
+
+```{r}
+#| label: cpp-beeswarm
+#| fig-width: 12
+#| fig-height: 7
+ggplot(cpp_samples, aes(implementation, seconds * 1e6, color = implementation)) +
+  ggbeeswarm::geom_quasirandom(width = 0.25, alpha = 0.45, size = 1.3) +
+  stat_summary(fun = median, geom = "point", shape = 95, size = 8, color = "black") +
+  facet_wrap(~batch, ncol = 3) + scale_y_log10() + theme_minimal() +
+  theme(legend.position = "none") +
+  labs(x = NULL, y = "Microseconds per gradient (log scale)",
+       subtitle = "Panels: batch size. Points: repetitions. Black bar: median.")
+```
+
+```{r}
+#| label: cpp-allocation
+#| fig-width: 10
+#| fig-height: 4
+ggplot(cpp_summary, aes(factor(batch), bytes / 1024, fill = implementation)) +
+  geom_col(position = "dodge") + theme_minimal() +
+  labs(x = "Batch size", y = "R-tracked allocation per evaluation (KiB)")
+```
+
+Allocation is not peak memory, and R's tracker does not capture every possible
+native C++ allocation. Retain the numeric table when small bars are hard to see.
+The optimizer comparison still uses R gradients: these plots establish a kernel
+speedup, not an end-to-end optimizer speedup. Use the profile to judge whether
+accelerating gradients addresses a major cost. If a fraction f of runtime could
+be accelerated by a factor s, an idealized total speedup is at most
+$1/[(1-f)+f/s]$, assuming the rest of the computation is unchanged. Moving the
+whole epoch loop into C++ addresses additional overhead; the next experiment tests this directly.
+
+# Complete SGD loop: allocation and runtime
+
+Here we compare complete mini-batch SGD update loops in R and C++, at batch sizes
+1, 16, 64 and 256. Change `sgd_batch_sizes` below to choose other sizes.
+Both process the same precomputed permutations with the same start and epoch-based
+power-law rates. This isolates implementation costs: data generation, compilation,
+permutation generation and trajectory monitoring are excluded from both timings.
+These are complete update runs, not end-to-end timings of the report's monitored
+solver. The other optimizer comparisons above remain unchanged.
+
+```{r}
+#| label: complete-sgd
+# A simple R baseline: the same gradient and update used by plain SGD.
+# No history is recorded, matching the C++ function's work.
+dose_sgd_r <- function(start, problem, orders, rates, batch_size = 1L) {
+  stopifnot(batch_size >= 1, batch_size <= problem$N, batch_size %% 1 == 0)
+  theta <- start
+  batch_starts <- seq.int(1L, nrow(orders), by = batch_size)
+  for (epoch in seq_len(ncol(orders))) {
+    for (first in batch_starts) {
+      last <- min(first + batch_size - 1L, nrow(orders))
+      index <- orders[first:last, epoch]
+      # gradient() averages over the actual batch, even if the last is shorter.
+      theta <- theta - rates[epoch] * gradient(theta, problem, index)
+    }
+  }
+  theta
+}
+sgd_batch_sizes <- c(1L, 16L, 64L, 256L)
+
+loop_samples <- data.frame()
+loop_summary <- data.frame()
+for (N in c(300, 15000)) {
+  p <- simulate_doses(N, "continuous", seed = 2026)$problem
+  start <- initial_parameters(p)
+  epochs <- 15L
+  set.seed(201)
+  orders <- replicate(epochs, sample.int(N))
+  rates <- learning_rate(0:(epochs - 1), settings$gamma0,
+                         settings$half_epochs, settings$a)
+
+  for (batch in sgd_batch_sizes) {
+    # Compare both implementations at every batch size, before benchmarking.
+    r_theta <- dose_sgd_r(start, p, orders, rates, batch)
+    cpp_theta <- dose_sgd_cpp(start, p$z, p$y, orders, rates, batch)
+    stopifnot(isTRUE(all.equal(r_theta, cpp_theta, tolerance = 1e-8)))
+    timings <- bench::mark(
+      R = dose_sgd_r(start, p, orders, rates, batch),
+      Rcpp = dose_sgd_cpp(start, p$z, p$y, orders, rates, batch),
+      iterations = 5, check = TRUE, filter_gc = FALSE)
+    samples <- benchmark_samples(timings)
+    samples$N <- N
+    samples$batch <- batch
+    loop_samples <- rbind(loop_samples, samples)
+    loop_summary <- rbind(loop_summary, data.frame(
+      N = N, batch = batch, implementation = as.character(timings$expression),
+      median_seconds = as.numeric(timings$median),
+      bytes = as.numeric(timings$mem_alloc),
+      final_mse = c(objective(r_theta, p), objective(cpp_theta, p))))
+  }
+}
+# A recorded zero is a measurement limitation, not zero memory use.
+loop_summary$allocation <- ifelse(loop_summary$bytes == 0,
+  "No allocation recorded", paste(format(round(loop_summary$bytes / 1024, 2),
+  trim = TRUE), "KiB"))
+knitr::kable(loop_summary[, c("N", "batch", "implementation", "median_seconds",
+                            "allocation", "final_mse")], digits = 6)
+```
+
+```{r}
+#| label: complete-sgd-time
+#| fig-width: 9
+#| fig-height: 4
+ggplot(loop_samples, aes(factor(batch), seconds, color = implementation)) +
+  ggbeeswarm::geom_quasirandom(width = 0.15, dodge.width = 0.6, size = 2) +
+  stat_summary(fun = median, geom = "point", shape = 95, size = 8,
+               color = "black", position = position_dodge(width = 0.6),
+               aes(group = interaction(batch, implementation))) +
+  facet_wrap(~N) + scale_y_log10() + theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = "Batch size", y = "Seconds per 15-epoch update run (log scale)",
+       subtitle = "Same observations, ordering, rates and starting parameters")
+```
+
+## Recorded allocation across batch sizes
+
+Each point represents cumulative R-tracked allocation for a complete 15-epoch run,
+not allocation per update or peak memory. Larger batches create larger temporary
+objects in R, but also require fewer updates. There is therefore no requirement for
+cumulative allocation to increase monotonically with batch size.
+
+```{r}
+#| label: sgd-batch-allocation
+#| fig-width: 10
+#| fig-height: 5
+# Plot only positive measurements on the log axis. Label unrecorded measurements
+# in a separate table; never replace zero with a made-up positive allocation.
+recorded <- loop_summary[loop_summary$bytes > 0, ]
+unrecorded <- loop_summary[loop_summary$bytes == 0, ]
+allocation_plot <- ggplot(recorded,
+  aes(factor(batch), bytes / 1024, color = implementation)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  facet_wrap(~N) + scale_y_log10() + theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(x = "Batch size", y = "Recorded allocation per 15-epoch run (KiB; log scale)",
+       subtitle = "Only positive recorded allocations shown; missing points listed below")
+allocation_plot
+```
+
+```{r}
+#| label: sgd-unrecorded-allocation
+# Explicitly identify missing points without claiming zero memory usage.
+knitr::kable(unrecorded[, c("N", "batch", "implementation", "allocation")],
+             row.names = FALSE)
+```
+
+R's tracker does not capture all small allocations or native C++ memory.
+**No allocation recorded** does not mean no memory use. Small batches may appear
+to allocate less simply because the profiler misses their small temporary objects.
+Use this plot to describe recorded allocations only; use the process-memory plot
+below for a measurement including the whole R session. Matching final MSE is checked
+between R and C++ at each batch size, but different batch sizes need not reach the
+same accuracy under this common epoch budget and learning-rate schedule.
+
+## Peak memory in separate R sessions
+
+To include memory outside R's allocation tracker, measure maximum resident process
+memory using macOS's `/usr/bin/time -l`. Each measurement starts a fresh R session.
+Both sessions load the same code and Rcpp library and read the same precomputed
+input. Compilation happens beforehand and is cached. Startup, library loading,
+input storage and the solver all contribute to the process peak, so these are
+**total session peaks**, not isolated gradient allocations. Five repetitions help
+show measurement variability; small differences should not be overinterpreted.
+The same four batch sizes are measured at N = 15,000.
+
+```{r}
+#| label: sgd-process-memory
+# This measurement uses the macOS utility available on this project computer.
+# Keeping it separate from bench::mark avoids confusing peak memory with allocation.
+peak_memory <- data.frame()
+if (Sys.info()[["sysname"]] == "Darwin") {
+  cache <- tempfile("sgd-cpp-cache-")
+  dir.create(cache)
+  cpp_file <- normalizePath("project_B/gradient.cpp")
+  Rcpp::sourceCpp(cpp_file, cacheDir = cache)
+  input_file <- tempfile(fileext = ".rds")
+  worker <- tempfile(fileext = ".R")
+  # Both child processes receive exactly the same data and setup.
+  saveRDS(list(problem = p, start = start, orders = orders, rates = rates,
+               model = normalizePath("project_B/model.R"),
+               cpp = cpp_file, cache = cache), input_file)
+  writeLines(c(
+    'args <- commandArgs(trailingOnly = TRUE)',
+    'input <- readRDS(args[1])',
+    'source(input$model)',
+    'Rcpp::sourceCpp(input$cpp, cacheDir = input$cache)',
+    'batch <- as.integer(args[3])',
+    'invisible(gc())'), worker)
+  dump("dose_sgd_r", file = worker, append = TRUE)
+  cat('\nif (args[2] == "R") {\n',
+      '  fit <- dose_sgd_r(input$start, input$problem, input$orders, input$rates, batch)\n',
+      '} else {\n',
+      '  fit <- dose_sgd_cpp(input$start, input$problem$z, input$problem$y, input$orders, input$rates, batch)\n',
+      '}\nstopifnot(all(is.finite(fit)))\n', file = worker, append = TRUE)
+  for (batch in sgd_batch_sizes) {
+  for (repetition in 1:5) {
+    for (implementation in c("R", "Rcpp")) {
+      output <- system2("/usr/bin/time", c("-l",
+        shQuote(file.path(R.home("bin"), "Rscript")), shQuote(worker),
+        shQuote(input_file), implementation, as.character(batch)), stdout = TRUE, stderr = TRUE)
+      stopifnot(is.null(attr(output, "status")))
+      line <- grep("maximum resident set size", output, value = TRUE)
+      stopifnot(length(line) == 1)
+      bytes <- as.numeric(strsplit(trimws(line), "[[:space:]]+")[[1]][1])
+      peak_memory <- rbind(peak_memory, data.frame(implementation, batch,
+        repetition, peak_MiB = bytes / 1024^2))
+    }
+  }
+  }
+  unlink(c(worker, input_file))
+  unlink(cache, recursive = TRUE)
+  knitr::kable(peak_memory, digits = 2)
+} else {
+  cat("Peak process-memory experiment requires macOS /usr/bin/time -l.")
+}
+```
+
+```{r}
+#| label: sgd-process-memory-plot
+#| fig-width: 8
+#| fig-height: 4
+if (nrow(peak_memory) > 0) {
+  ggplot(peak_memory, aes(factor(batch), peak_MiB, color = implementation)) +
+    ggbeeswarm::geom_quasirandom(width = 0.15, dodge.width = 0.6, size = 2.5) +
+    stat_summary(fun = median, geom = "point", shape = 95, size = 9,
+                 color = "black", position = position_dodge(width = 0.6),
+                 aes(group = interaction(batch, implementation))) +
+    expand_limits(y = 0) + theme_minimal() +
+    theme(legend.position = "bottom") +
+    labs(x = "Batch size", y = "Peak resident process memory (MiB)",
+         subtitle = "N = 15,000; 15 epochs; separate R sessions with identical setup")
+}
+```
+
+The C++ loop reuses four parameter values and scalar intermediates, whereas R
+repeatedly constructs gradient intermediates. This can reduce runtime and memory
+pressure, but does not guarantee a large reduction in total process peak: the R
+runtime, libraries and input data may dominate. Report the measured differences,
+including overlap, rather than claiming zero memory use or universal memory savings.
+
+# Interpreting the combined experiments
+
+Judge accuracy and runtime together. Starts and step sizes test sensitivity; geometry
+shows how similar per-evaluation cost can require different optimization effort.
+Deterministic momentum adds work and may restart, but can reduce the accepted updates
+needed. Stochastic momentum can oscillate, and AdaGrad can damp later progress.
+Full-batch scheduled GD takes far fewer updates under an equal-pass budget. These
+observations do not establish a universal winner.
+
+For repeated doses, exact compression can be more valuable than changing update
+rules. Continuous doses lack this shortcut. This connects the experimental design,
+numerical behavior and computational costs.
+
+```{r}
+#| label: session
+sessionInfo()
+```
