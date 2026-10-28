@@ -1,0 +1,121 @@
+---
+title: "Improving stopped-path bookkeeping"
+subtitle: "Original versus survivor-index implementation"
+---
+
+## What changes?
+
+The original stopped estimator reconstructs the active indices from all ruin times
+at every step. It then checks again that active paths have not previously ruined.
+The new `estimate_ruin_survivors()` starts with all indices active and removes
+newly ruined paths after each step. Active paths are therefore known survivors.
+
+Increment generation, likelihood weights, and contribution summaries are unchanged.
+Survivors keep their original order, so identical seeds should give exactly the
+same random paths and results. This experiment investigates runtime only; the
+statistical estimator and its variance are unchanged.
+
+```{r}
+#| label: comparison-setup
+for (file in c("model.R", "importance_sampling.R", "stopped_survivors.R")) {
+  source(file.path("project_A", file))
+}
+library(ggplot2)
+if (!requireNamespace("ggbeeswarm", quietly = TRUE)) {
+  stop("Install ggbeeswarm before rendering this report.")
+}
+theta_grid <- c(-0.55, -0.30, -0.10, 0)
+knitr::opts_chunk$set(fig.width = 12, fig.height = 5)
+```
+
+## Check that results are identical
+
+Before timing, compare individual contributions, ruin times, simulated step counts,
+and summaries at each tilt. Each pair uses seed 5301 plus its grid index and 2,000
+paths. `identical()` checks the complete returned object, not merely agreement
+within Monte Carlo uncertainty. The separate test suite also covers all-ruin and
+no-ruin cases (`Rscript tests/run_tests.R` from the assignment root).
+
+```{r}
+#| label: comparison-correctness
+checks <- data.frame(theta = theta_grid, identical_results = FALSE)
+for (i in seq_along(theta_grid)) {
+  set.seed(5301 + i)
+  original <- estimate_ruin(2000, theta_grid[i], "stopped", diagnostics = TRUE)
+  set.seed(5301 + i)
+  improved <- estimate_ruin_survivors(2000, theta_grid[i], diagnostics = TRUE)
+  checks$identical_results[i] <- identical(original, improved)
+}
+stopifnot(all(checks$identical_results))
+knitr::kable(checks, row.names = FALSE)
+```
+
+## Paired timing experiment
+
+We use 150,000 paths per batch and 15 repetitions at each of four tilts:
+120 timed batches in total. Seed 5201 determines randomized pair and execution
+order. Each original/improved pair uses the same seed and random draws. Warm-up,
+garbage collection, seed initialization, and equality checks are outside timing.
+Every pair also verifies exact summary equality. All reusable code lives in
+`project_A/stopped_survivors.R`.
+
+```{r}
+#| label: comparison-benchmark
+raw <- benchmark_stopped_versions(theta_grid, n = 150000, repetitions = 15, seed = 5201)
+summary <- summarize_stopped_benchmark(raw)
+knitr::kable(summary, digits = 3, row.names = FALSE)
+if (min(raw$elapsed) < 0.05) {
+  cat("Some batches are shorter than 0.05 seconds; increase n for stronger timing evidence.")
+}
+write.csv(raw, file.path("report", "stopped_benchmark_raw.csv"), row.names = FALSE)
+write.csv(summary, file.path("report", "stopped_benchmark_summary.csv"), row.names = FALSE)
+```
+
+## Beeswarm comparison
+
+Every dot is one timed batch. Boxplots summarize the repetition distribution;
+all panels share the same vertical scale. The plot displays marginal timings,
+while speedups in the table use matched original/improved pairs.
+
+```{r}
+#| label: comparison-beeswarm
+#| fig-cap: "Original and survivor-index runtimes across four tilts; lower is faster. Identical seeds give identical simulation workloads within each pair."
+raw$implementation <- factor(raw$implementation, levels = c("Original", "Survivor indices"))
+raw$tilt <- factor(sprintf("theta = %.2f", raw$theta),
+                   levels = sprintf("theta = %.2f", sort(unique(raw$theta))))
+p <- ggplot(raw, aes(implementation, elapsed, color = implementation)) +
+  geom_boxplot(width = 0.45, outlier.shape = NA, alpha = 0.12) +
+  ggbeeswarm::geom_beeswarm(size = 2, cex = 0.75) +
+  facet_wrap(~tilt, nrow = 1) +
+  scale_color_manual(values = c("Original" = "#D55E00", "Survivor indices" = "#0072B2")) +
+  labs(title = "Does maintaining survivor indices reduce runtime?",
+       subtitle = "Stopped estimators: 150,000 paths per batch; 15 paired repetitions per tilt",
+       x = NULL, y = "Elapsed seconds per batch",
+       caption = "") +
+  theme_minimal(base_size = 11) + theme(legend.position = "none",
+                                      axis.text.x = element_text(angle = 20, hjust = 1))
+p
+ggsave(file.path("report", "figures", "stopped_survivors_beeswarm.png"), p,
+       width = 12, height = 5, dpi = 180)
+```
+
+## Interpretation
+
+The median paired time saving ranges from
+**`r round(min(summary$median_paired_time_saved_pct), 1)`%** to
+**`r round(max(summary$median_paired_time_saved_pct), 1)`%** across these settings.
+Positive savings and speedups above one favor survivor indices; negative savings
+mean the new implementation was slower. Exact results match, so measured differences
+come from implementation cost and timing noise rather than different simulated paths.
+
+Maintaining survivors avoids repeated full-vector scans and a redundant crossing
+check. Filtering the remaining indices still costs time, so gains depend on tilt
+and sample size. These local measurements do not guarantee the same speedup on
+another machine. Raw and summary CSV files are saved beside this report, and
+`figures/stopped_survivors_beeswarm.png` is saved for slides.
+
+```{r}
+#| label: comparison-session
+#| code-fold: true
+sessionInfo()
+```

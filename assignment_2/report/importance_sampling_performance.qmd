@@ -1,0 +1,572 @@
+---
+title: "Finite-horizon ruin: computational cost and precision"
+subtitle: "Assignment 2b · Benchmarking and profiling"
+---
+
+## Objectives and fair comparisons
+
+Statistical variance per trajectory is only part of computational efficiency.
+With independent contributions of variance $v(\theta)$ and average cost
+$c(\theta)$ seconds per trajectory, a budget of $T$ seconds permits approximately
+$N=T/c(\theta)$ trajectories. Hence
+$$\operatorname{Var}(\hat p)\approx\frac{v(\theta)c(\theta)}{T}.$$
+The variance optimum minimizes $v$; the cost optimum minimizes $vc$.
+The investigation asks whether the extra computation saved by stopping changes
+the tilt that gives the best precision for a fixed time budget.
+The first-passage problem, densities, and Rao–Blackwell argument are developed in
+the statistical companion report.
+
+```{r}
+#| label: setup
+# The Quarto project sets the execution directory to the assignment root.
+for (file in c("model.R", "theory.R", "simulation.R", "importance_sampling.R", "experiments.R", "stopped_survivors.R")) {
+  source(file.path("project_A", file), keep.source = TRUE)
+}
+library(ggplot2)
+knitr::opts_chunk$set(fig.width = 8, fig.height = 5, digits = 4)
+theta_grid <- seq(-0.65, -0.05, by = 0.05)
+```
+
+
+We benchmark the same readable, time-wise vectorized implementation for full and
+stopped paths. Crude MC follows full trajectories at $\theta=0$. The comparison
+therefore applies to these implementations and this machine, not an abstract
+lower bound on the cost of either algorithm. A stopped crude implementation could
+save additional work and would be a useful extension.
+
+We use 13 candidate tilts from -0.65 to -0.05 in steps of 0.05: with two IS
+methods and five repetitions this gives 130 IS batches, plus five crude-MC
+batches. This coarse grid locates useful parameter regions without 610 IS
+batches from a 0.01 grid; any finer follow-up should concentrate near the minima.
+We time fixed batches of 150,000 paths, with five repetitions per configuration.
+Each batch includes increment generation, bookkeeping, likelihood calculation,
+and contribution summarization. Seeds, garbage collection, and the warm-up are
+outside the timer. Job order is randomized (seed 3101), and repetitions use seed
+3101 plus their job index. No plots or pilot-selection code are timed.
+Elapsed wall-clock times vary with machine load; compare the whole distribution.
+
+```{r}
+#| label: benchmark-batches
+benchmark_raw <- benchmark_methods(theta_grid, n = 150000, repetitions = 5, seed = 3101)
+crude_raw <- benchmark_methods(0, n = 150000, repetitions = 5, seed = 3501, methods = "crude")
+benchmark_summary <- summarize_benchmarks(benchmark_raw)
+crude_summary <- summarize_benchmarks(crude_raw)
+knitr::kable(data.frame(minimum_batch_seconds = min(c(benchmark_raw$elapsed, crude_raw$elapsed)),
+                        trajectories_per_batch = 150000, repetitions = 5))
+if (min(c(benchmark_raw$elapsed, crude_raw$elapsed)) < 0.05) {
+  cat("Some batches took less than 0.05 seconds: timer resolution may affect comparisons; increase n for a stronger benchmark.\n")
+}
+```
+
+```{r}
+#| label: timing-distribution
+#| fig-cap: "Every timed repetition, with small horizontal jitter to reveal overlaps."
+set.seed(3601)
+p <- ggplot(
+  rbind(benchmark_raw, crude_raw),
+  aes(factor(round(theta, 3)), elapsed, color = method)
+) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(
+    position = position_jitter(width = 0.12, height = 0),
+    alpha = 0.65
+  ) +
+  scale_x_discrete(
+    breaks = function(values) values[seq(1, length(values), by = 2)]
+  ) +
+  labs(
+    title = "Batch timing distributions",
+    x = expression(theta),
+    y = "Elapsed seconds for 150,000 paths"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+p
+
+# ggsave("/Users/carl-emilkrarupjensen/Desktop/Kandidat/Compstat/Compstat R/assignment_2/report/figures/runtime_comparison.png",p, width=8, height= 8)
+
+```
+
+This jittered distribution serves the same purpose as a beeswarm without another
+package dependency. We retain every repetition rather than reporting only the
+fastest run. Timing error bars below span the observed minimum and maximum; they
+are descriptive ranges, not confidence intervals.
+
+## Early stopping
+
+Stopped simulations draw $\min(\tau,100)$ increments, whereas full simulations
+draw 100 even after ruin. Non-ruined paths always use 100 steps. Thus the mean
+simulated steps is a **censored** stopping time, not $E[\tau]$ and not the mean
+ruin time conditional on ruin. Stronger negative tilts tend to shorten it.
+
+```{r}
+#| label: mean-steps
+#| fig-cap: "Average number of increments actually generated per trajectory."
+ggplot(benchmark_summary, aes(theta, mean_steps, color = method)) + geom_line() + geom_point() +
+  labs(title = "Early stopping saves increments", x = expression(theta), y = "Mean simulated steps") + theme_minimal()
+```
+
+```{r}
+#| label: runtime-versus-theta
+#| fig-cap: "Median batch runtime and observed repetition range."
+ggplot(benchmark_summary, aes(theta, elapsed, color = method)) + geom_line() + geom_point() +
+  geom_errorbar(aes(ymin = elapsed_min, ymax = elapsed_max), width = 0.01) +
+  labs(title = "Wall-clock cost depends on implementation", x = expression(theta), y = "Seconds per batch") + theme_minimal()
+```
+
+```{r}
+#| label: computational-savings
+#| fig-cap: "Fractions saved by stopping, relative to full paths at the same tilt."
+full_cost <- subset(benchmark_summary, method == "full")
+stop_cost <- subset(benchmark_summary, method == "stopped")
+savings <- merge(full_cost, stop_cost, by = "theta", suffixes = c("_full", "_stopped"))
+savings_plot <- rbind(
+  data.frame(theta = savings$theta, metric = "Increment savings", saved = 1 - savings$mean_steps_stopped / savings$mean_steps_full),
+  data.frame(theta = savings$theta, metric = "Runtime savings", saved = 1 - savings$elapsed_stopped / savings$elapsed_full))
+ggplot(savings_plot, aes(theta, saved, color = metric)) + geom_line() + geom_point() +
+  geom_hline(yintercept = 0) + labs(title = "Fewer increments need not give proportional runtime savings", x = expression(theta), y = "Fraction saved") + theme_minimal()
+```
+
+A negative runtime saving means stopping was slower. Managing active indices,
+subsetting vectors, and tracking crossings has overhead. Small active batches
+also use vectorized random generation less effectively. Therefore saved random
+draws need not translate one for one into saved seconds.
+
+## Statistical versus cost-adjusted parameter selection
+
+These benchmark simulations are **pilots**. We combine the mean contribution
+variance over repetitions with median cost per trajectory. Then we select both
+grid minima separately for each estimator. The following curves concern
+individual-contribution variance and seconds per trajectory, not variance of a
+150,000-path average.
+
+```{r}
+#| label: cost-objective
+#| fig-cap: "Estimated variance times median computational cost per sample across candidate tilts."
+variance_selected <- select_theta(benchmark_summary, "contribution_variance")
+cost_selected <- select_theta(benchmark_summary, "variance_cost")
+ggplot(benchmark_summary, aes(theta, variance_cost, color = method)) + geom_line() + geom_point() +
+  scale_y_log10() +
+  labs(title = "Error achievable per second", x = expression(theta), y = "Contribution variance × seconds/trajectory (log)") + theme_minimal()
+comparison <- data.frame(method = variance_selected$method,
+  theta_variance = variance_selected$theta,
+  theta_cost = cost_selected$theta[match(variance_selected$method, cost_selected$method)])
+knitr::kable(comparison, digits = 5, row.names = FALSE)
+knitr::kable(benchmark_summary, digits = 7, row.names = FALSE)
+```
+
+The table reports empirical grid optima. Small shifts along a flat curve may be
+explained by timing noise or variance-estimation error. A grid winner is not
+proof of a distinct continuous optimum. Independent final evaluation below avoids
+reusing the same simulated contributions to claim a precision benefit.
+
+## Independent evaluation and target precision
+
+Using new random streams (seed 3701), evaluate crude Monte Carlo and the
+variance-selected and cost-selected configurations with five batches of 150,000
+paths. For a common probability denominator, use a separate 200,000-path stopped
+run at its pilot variance-selected tilt (seed 3801).
+For target relative standard error $r=0.05$, estimate
+$$N_{\rm req}=\left\lceil\frac{\hat v}{r^2\hat p^2}\right\rceil,
+\qquad T_{\rm req}=N_{\rm req}\hat c.$$
+These are planning calculations rather than guaranteed precision or deadlines.
+
+```{r}
+#| label: independent-validation
+configurations <- rbind(
+  data.frame(method = "crude", choice = "Original", theta = 0),
+  data.frame(method = variance_selected$method, choice = "Variance minimum", theta = variance_selected$theta),
+  data.frame(method = cost_selected$method, choice = "Cost minimum", theta = cost_selected$theta))
+validation_rows <- lapply(seq_len(nrow(configurations)), function(i) {
+  raw <- benchmark_methods(configurations$theta[i], n = 150000, repetitions = 5,
+                           seed = 3701 + 100 * i, methods = configurations$method[i])
+  summary <- summarize_benchmarks(raw)
+  summary$choice <- configurations$choice[i]
+  summary
+})
+validation <- do.call(rbind, validation_rows)
+set.seed(3801)
+reference_theta <- variance_selected$theta[variance_selected$method == "stopped"]
+reference <- estimate_ruin(200000, reference_theta, "stopped")$summary
+budget <- precision_budget(validation, reference$estimate)
+knitr::kable(reference[, c("estimate", "standard_error", "relative_standard_error")], digits = 6)
+knitr::kable(budget[, c("method", "choice", "theta", "estimate", "contribution_variance", "cost_per_sample", "variance_cost", "required_n", "required_seconds")], digits = 7, row.names = FALSE)
+```
+
+```{r}
+#| label: equal-precision-time
+#| fig-cap: "Extrapolated time to 5% relative standard error using independent validation."
+budget$configuration <- paste(budget$method, budget$choice, sep = ": ")
+ggplot(budget, aes(required_seconds, reorder(configuration, required_seconds))) + geom_point(size = 2) +
+  labs(title = "Time needed for approximately equal precision", x = "Predicted seconds for 5% RSE", y = NULL) + theme_minimal()
+```
+
+Batch overhead, changing memory pressure, operating-system scheduling, and noisy
+variance estimates limit linear extrapolation. A predicted time shorter than a
+measured batch is especially uncertain. The probability reference is itself
+estimated, so required sizes inherit its uncertainty. Normal-interval accuracy
+also depends on enough representative weighted contributions; the target RSE
+alone does not ensure coverage. These predictions should be checked with fresh
+runs when actual precision requirements matter.
+
+## Profiling
+
+We sample the R call stack every 0.01 seconds for at least two seconds per method
+(seed 4101). Inclusive times overlap across nested functions and must not be added.
+Profiling has overhead; these runs do not supply the benchmark costs above.
+The readable algorithms use neither path matrices nor cumulative sums in their
+main estimation loop; these allocations occur only in the illustrative path
+simulator, outside the benchmark.
+
+```{r}
+#| label: profiles
+#| results: asis
+profiles <- lapply(c("crude", "full", "stopped"), function(method) {
+  profile_theta <- if (method == "crude") 0 else
+    variance_selected$theta[variance_selected$method == method]
+  profile_method(method, profile_theta,
+                 file = file.path(tempdir(), paste0("ruin-", method, ".out")))
+})
+names(profiles) <- c("crude", "full", "stopped")
+for (method in names(profiles)) {
+  cat("\n\n### ", method, ": largest self-time costs\n\n", sep = "")
+  print(knitr::kable(head(profiles[[method]], 10), row.names = TRUE))
+  cat("\n\n")
+}
+```
+
+```{r}
+#| label: profile-findings
+for (method in names(profiles)) {
+  profile <- profiles[[method]]
+  candidates <- setdiff(rownames(profile), c('"estimate_ruin"', '"profile_method"', '"FUN"', '"lapply"', '"eval"', '"withVisible"'))
+  cat(method, ": largest self-time non-wrapper entry: ",
+      if (length(candidates)) candidates[1] else "no resolved entry", ".\n", sep = "")
+}
+```
+
+Tables are sorted by self time (time spent in the function itself); total time includes child calls. Read these entries alongside the algorithms: `r_tilted`/`runif` represent random
+generation and inverse transformation; `which` and indexed updates represent
+stopping bookkeeping; summary and likelihood functions process final vectors.
+R's sampling profiler may assign compiled work to its enclosing R function, so
+these categories cannot always be separated exactly. Log weights are calculated
+once per ruined trajectory after simulation, whereas increment generation and
+capital updates recur at every step. The workload is largely repeated simulation
+and memory/index management. Profiling at each method's selected tilt helps
+identify the implementation costs relevant to its practical use.
+Only optimize further if the observed profiles justify it; changing vectorization
+could alter the runtime-optimal tilt without changing the exact variance curve.
+
+### Looking inside `estimate_ruin()` with line profiling
+
+A large function-level self time tells us that `estimate_ruin()` is expensive,
+but not which expressions are responsible. We therefore also use
+`Rprof(line.profiling = TRUE)` and `summaryRprof(lines = "show")`. The setup
+sources every module with `keep.source = TRUE`, which retains the source
+locations needed for this analysis. See the [R profiling documentation](https://stat.ethz.ch/R-manual/R-devel/library/utils/html/Rprof.html).
+
+This is a separate diagnostic experiment: all three methods use 50 batches of
+50,000 paths at the same illustrative tilt -0.30 (crude MC still uses zero).
+Seeds are 4201, 4202, and 4203 for crude, full, and stopped, respectively.
+Warm-up, garbage collection, and seed initialization are outside the sampled
+region. Fixed batches avoid repeatedly timing the profiling loop itself.
+No simulation algorithm or likelihood calculation is changed.
+
+```{r}
+#| label: line-profiling
+line_profiles <- list()
+line_rows <- list()
+profile_methods <- c("crude", "full", "stopped")
+for (i in seq_along(profile_methods)) {
+  method <- profile_methods[i]
+  line_profiles[[method]] <- profile_source_lines(
+    method, theta = -0.30, n = 50000, batches = 50, seed = 4200 + i
+  )
+  row <- line_profiles[[method]]$lines
+  row$method <- method
+  line_rows[[method]] <- row
+}
+line_results <- do.call(rbind, line_rows)
+```
+
+The table below joins measured costs directly to the source code. `self.time`
+is time attributed to that source line, excluding time attributed to other
+source lines. Calls without their own retained source location (including some
+built-in operations) can be charged to the calling line. `total.time` also
+includes descendant source lines: for example, the capital-update line calls
+`r_tilted()`, so its total time includes the sampler. Do not add inclusive times
+across parent and child lines. A multi-line expression may be attributed to its
+first line rather than its continuation.
+
+```{r}
+#| label: line-profile-tables
+#| results: asis
+for (method in profile_methods) {
+  cat("\n\n#### ", method, ": source statements with the most self time\n\n", sep = "")
+  rows <- head(line_profiles[[method]]$lines, 10)
+  print(knitr::kable(rows[, c("location", "code", "self.time", "self.pct",
+                              "total.time", "total.pct")], digits = 2, row.names = FALSE))
+  cat("\n\n")
+}
+```
+
+```{r}
+#| label: line-profile-plot
+#| fig-height: 7
+#| fig-cap: "Source-line self time inside the estimator. Labels refer to the exact statements in the tables; percentages use the whole profiling run as denominator."
+estimator_lines <- subset(line_results, source_file == "importance_sampling.R" & self.time > 0)
+estimator_lines$statement <- paste0("Line ", estimator_lines$line)
+ggplot(estimator_lines, aes(self.pct, reorder(statement, self.pct))) +
+  geom_col(fill = "steelblue") + facet_wrap(~method, ncol = 1, scales = "free_y") +
+  labs(title = "Which statements account for estimator time?",
+       x = "Source-line self time (% of sampled run)", y = NULL) + theme_minimal()
+ggsave(file.path("report", "figures", "estimator_line_profile.png"),
+       width = 9, height = 7, dpi = 150)
+```
+
+Read the highest-cost lines as evidence for specific follow-up experiments:
+
+| Observed expensive statement | What to investigate next |
+|:--|:--|
+| `active <- ... which(is.infinite(times)) ...` | Cost of selecting surviving paths |
+| `capital[active] <- ... r_tilted(...)` | Indexed capital updates; compare self versus total to separate sampler costs |
+| `steps[active] <- k` | Repeated indexed assignments |
+| `newly_ruined <- ...` and `times[newly_ruined] <- k` | Crossing detection and first-ruin bookkeeping |
+| Inverse-transform line in `model.R` | Transform arithmetic and temporary vectors; constants could be precomputed |
+| `contributions[ruined] <- ...` | Final weighting, applied only to ruined paths |
+
+```{r}
+#| label: line-profile-findings
+#| results: asis
+for (method in profile_methods) {
+  rows <- subset(line_profiles[[method]]$lines, source_file == "importance_sampling.R")
+  if (nrow(rows) > 0) {
+    best <- rows[which.max(rows$self.time), ]
+    cat("\n\nFor **", method, "**, the largest estimator source-line self time was **",
+        best$location, "** (", round(best$self.pct, 1),
+        "% of the sampled run). Check its source expression in the table before\n",
+        "choosing an optimization.\n", sep = "")
+  }
+}
+```
+
+These are sampled estimates, not exact timers for individual statements. Missing
+or zero-cost lines may simply have received no samples. Source-line self time
+is finer than function-level self time, but still cannot distinguish every
+operation within one expression. Profiling identifies candidates for improvement;
+a fresh benchmark must establish whether an implementation change is faster.
+The diagnostic shares are not renormalized to the displayed rows, and do not
+measure absolute runtime differences between methods.
+
+This experiment measures **time, not memory**. Indexed assignments and inverse
+transformations may allocate temporary vectors, but timing alone does not
+establish allocation size or peak memory. Memory profiling would require a
+separate measurement, rather than interpreting these timing columns as memory
+usage. The plot is also saved as `report/figures/estimator_line_profile.png` for
+presentation use.
+
+## Performance conclusion
+
+For full paths, the pilot
+variance and cost minima are respectively
+**`r round(comparison$theta_variance[comparison$method == "full"], 4)`** and
+**`r round(comparison$theta_cost[comparison$method == "full"], 4)`**.
+For stopped paths they are
+**`r round(comparison$theta_variance[comparison$method == "stopped"], 4)`** and
+**`r round(comparison$theta_cost[comparison$method == "stopped"], 4)`**.
+
+`r if (all(abs(comparison$theta_variance - comparison$theta_cost) < 0.051)) "The selected variance and cost tilts coincide or differ by about one grid step. This experiment provides little evidence for a practically distinct computational optimum." else "At least one cost-selected tilt differs by more than one regular grid step from its variance-selected counterpart. The independent validation and timing spread should determine whether this shift has a practical efficiency benefit."`
+
+The smallest independently evaluated variance-cost product belongs to
+**`r budget$configuration[which.min(budget$variance_cost)]`**. Because final
+measurements are noisy, this does not retroactively redefine the pilot-selected
+parameters. Variance selection minimizes statistical variability per trajectory;
+cost selection balances that variability against measured runtime. A difference is possible, but is not required.
+The exact stopped-path variance improvement follows from conditioning; a runtime
+improvement must be established empirically for the chosen implementation.
+
+## Can a faster tilt outperform the variance-minimizing tilt?
+
+We now investigate this question using the improved `estimate_ruin_survivors()`
+implementation throughout. Its bookkeeping changes the runtime, so it needs its
+own computational comparison rather than inheriting the original method's costs.
+Here “stronger tilt” means more negative theta; values closer to zero are also
+included for comparison.
+
+For a fixed time budget, define the relative objective
+$$
+R(\theta)=\frac{v(\theta)c(\theta)}
+ {v(\theta_{\mathrm{var}})c(\theta_{\mathrm{var}})}
+=\underbrace{\frac{v(\theta)}{v(\theta_{\mathrm{var}})}}_{\text{relative variance}}
+ \underbrace{\frac{c(\theta)}{c(\theta_{\mathrm{var}})}}_{\text{relative runtime}}.
+$$
+An $R$ below one predicts less computing time for the same target precision,
+or lower estimator variance for the same time budget. For example, a 20% cost
+reduction and a 10% variance increase give $R=0.8\times1.1=0.88$, a predicted
+12% saving. The variance here is that of one contribution, not its sample mean.
+
+### Select on a pilot, then freeze the reference
+
+A modest local pilot grid uses -0.45 to -0.15 in steps of 0.025, with three
+50,000-path batches per tilt (39 batches; seed 7101). It selects both a
+variance-minimizing and a variance-cost-minimizing grid point using the improved
+implementation. The reference is then frozen. The final data must not be used to
+reselect the reference: otherwise its comparison would be biased by selection.
+
+```{r}
+#| label: survivor-efficiency-pilot
+survivor_pilot_raw <- benchmark_survivor_tilts(
+  seq(-0.45, -0.15, by = 0.025), n = 50000, repetitions = 3, seed = 7101
+)
+survivor_pilot <- summarize_benchmarks(survivor_pilot_raw)
+variance_theta <- survivor_pilot$theta[which.min(survivor_pilot$contribution_variance)]
+cost_theta <- survivor_pilot$theta[which.min(survivor_pilot$variance_cost)]
+knitr::kable(data.frame(selection = c("Pilot variance minimum (reference)", "Pilot cost minimum"),
+                        theta = c(variance_theta, cost_theta)), row.names = FALSE)
+```
+
+### Independent evaluation of stronger and weaker tilts
+
+Evaluate -0.55 to -0.05 in steps of 0.05, adding the two pilot-selected values
+if necessary. Nine 150,000-path batches per candidate use fresh streams
+(seed 7201 plus randomized job index). The grid remains small: at most 13
+candidates and 117 timed batches. Each run generates new independent paths;
+randomized job order reduces systematic timing drift. Seeds, warm-up, and GC
+are outside timing. Aggregate variance is the mean batch contribution variance;
+cost is the median batch elapsed time divided by 150,000.
+
+```{r}
+#| label: survivor-efficiency-validation
+survivor_grid <- sort(unique(round(c(seq(-0.55, -0.05, by = 0.05),
+                                     variance_theta, cost_theta), 8)))
+survivor_final_raw <- benchmark_survivor_tilts(
+  survivor_grid, n = 150000, repetitions = 9, seed = 7201
+)
+survivor_final <- summarize_benchmarks(survivor_final_raw)
+survivor_relative <- relative_survivor_efficiency(survivor_final, variance_theta)
+survivor_relative$selection <- "Candidate"
+survivor_relative$selection[abs(survivor_relative$theta - cost_theta) < 1e-7] <- "Pilot cost minimum"
+survivor_relative$selection[abs(survivor_relative$theta - variance_theta) < 1e-7] <- "Variance reference"
+if (abs(cost_theta - variance_theta) < 1e-7) {
+  survivor_relative$selection[abs(survivor_relative$theta - variance_theta) < 1e-7] <- "Both pilot minima"
+}
+if (min(survivor_final_raw$elapsed) < 0.05) {
+  cat("Some batches were shorter than 0.05 seconds: interpret small cost differences cautiously.")
+}
+```
+
+The reference need not have the smallest empirical variance in the new sample:
+it was selected using a different pilot. Likewise the independently measured
+cost-selected tilt may not beat it. These are useful results, not reasons to
+reselect a winner from the validation data.
+
+### Visualize the variance--runtime tradeoff
+
+```{r}
+#| label: survivor-efficiency-tradeoff
+#| fig-cap: "Each tilt is located by its relative time per trajectory and contribution variance. Below the dashed curve, variance times cost is smaller than at the frozen variance reference. Labels show theta; selected points have distinct shapes."
+tradeoff <- ggplot(survivor_relative,
+                   aes(relative_runtime, relative_variance, color = theta)) +
+  geom_function(fun = function(x) 1 / x, linetype = 2, color = "grey40") +
+  geom_vline(xintercept = 1, color = "grey80") + geom_hline(yintercept = 1, color = "grey80") +
+  geom_point(aes(shape = selection), size = 3) +
+  geom_text(aes(label = sprintf("%.3f", theta)), vjust = -0.8, size = 3, check_overlap = TRUE) +
+  scale_y_log10() + scale_color_gradient(low = "#0072B2", high = "#D55E00") +
+  labs(title = "Does saving simulation time compensate for higher variance?",
+       subtitle = "Reference = 1 on both axes; dashed curve is equal computational efficiency",
+       x = "Time per trajectory / reference time", y = "Contribution variance / reference variance (log)",
+       shape = NULL, color = expression(theta)) + theme_minimal()
+tradeoff
+ggsave(file.path("report", "figures", "survivor_efficiency_tradeoff.png"),
+       tradeoff, width = 9, height = 6, dpi = 160)
+```
+
+Moving left means faster trajectories; moving down means less statistical
+variance. A point above one in variance can still be preferable if its runtime
+saving places it below $y=1/x$. Proximity to that boundary requires more precise
+measurements before claiming a meaningful improvement.
+
+```{r}
+#| label: survivor-efficiency-relative-cost
+#| fig-cap: "Relative variance-cost product from independent evaluation; below one is better than the pilot variance-selected reference. Grey dots show individual-batch products divided by the aggregate reference product, illustrating variability rather than confidence intervals."
+reference_row <- survivor_relative[abs(survivor_relative$theta - variance_theta) < 1e-7, ]
+reference_product <- reference_row$contribution_variance * reference_row$cost_per_sample
+survivor_final_raw$relative_batch_product <- survivor_final_raw$variance_cost / reference_product
+relative_plot <- ggplot(survivor_relative, aes(theta, relative_cost)) +
+  geom_hline(yintercept = 1, linetype = 2, color = "firebrick") +
+  geom_point(data = survivor_final_raw, aes(theta, relative_batch_product),
+             color = "grey65", alpha = 0.5, size = 1.2) +
+  geom_line(color = "#0072B2") + geom_point(aes(shape = selection), size = 3, color = "#0072B2") +
+  scale_y_log10() +
+  labs(title = "Computational efficiency relative to the variance-selected tilt",
+       subtitle = paste("Frozen reference theta =", sprintf("%.3f", variance_theta)),
+       x = expression(theta), y = "Relative variance × cost (log scale)", shape = NULL) + theme_minimal()
+relative_plot
+ggsave(file.path("report", "figures", "survivor_relative_efficiency.png"),
+       relative_plot, width = 9, height = 5, dpi = 160)
+```
+
+### Performance metrics and equal-precision interpretation
+
+A separate 200,000-path run at the frozen reference (seed 7301) supplies a common
+probability estimate for projecting sample sizes and time to 5% relative standard
+error. This run is independent of both selection and benchmark evaluation.
+
+```{r}
+#| label: survivor-efficiency-metrics
+set.seed(7301)
+survivor_probability <- estimate_ruin_survivors(200000, variance_theta)$summary
+survivor_relative <- precision_budget(survivor_relative, survivor_probability$estimate, target_rse = 0.05)
+metrics <- data.frame(
+  theta = survivor_relative$theta, selection = survivor_relative$selection,
+  probability = survivor_relative$estimate, mean_steps = survivor_relative$mean_steps,
+  variance_x_1e6 = survivor_relative$contribution_variance * 1e6,
+  microseconds_per_path = survivor_relative$cost_per_sample * 1e6,
+  relative_cost = survivor_relative$relative_cost,
+  time_saved_pct = survivor_relative$predicted_time_saved_pct,
+  seconds_for_5pct_RSE = survivor_relative$required_seconds
+)
+knitr::kable(metrics, digits = 4, row.names = FALSE)
+knitr::kable(survivor_probability[, c("estimate", "standard_error", "relative_standard_error")], digits = 7)
+write.csv(survivor_pilot_raw, file.path("report", "survivor_efficiency_pilot.csv"), row.names = FALSE)
+write.csv(survivor_final_raw, file.path("report", "survivor_efficiency_raw.csv"), row.names = FALSE)
+write.csv(survivor_relative, file.path("report", "survivor_efficiency_summary.csv"), row.names = FALSE)
+```
+
+Negative time savings mean a tilt is less efficient than the reference. The
+projected times use a linear cost model, and may be shorter than a timed batch;
+startup effects and timer resolution make such short-time extrapolations rough.
+The separate probability estimate is itself uncertain. Timing repetitions also
+do not provide a confidence interval for the ratio: all ratios share an estimated
+denominator, and the grey-dot spread does not include its uncertainty.
+
+### What does the independent comparison show?
+
+The improved implementation's pilot selected **`r sprintf("%.3f", variance_theta)`**
+for variance and **`r sprintf("%.3f", cost_theta)`** for variance times cost.
+In independent evaluation, the pilot cost-selected tilt has relative cost
+**`r round(survivor_relative$relative_cost[abs(survivor_relative$theta - cost_theta) < 1e-7], 3)`**.
+`r if (abs(variance_theta - cost_theta) < 1e-7) "Both selection objectives chose the same tilt; its relative cost is one by construction." else if (survivor_relative$relative_cost[abs(survivor_relative$theta - cost_theta) < 1e-7] < 1) "The independently evaluated product favors the pilot cost-selected tilt, although the size and variability of the difference matter." else "The pilot cost-selected tilt did not beat the variance reference in independent evaluation; a computational advantage is not established."`
+
+The smallest observed validation ratio is
+**`r round(min(survivor_relative$relative_cost), 3)`** at
+**`r sprintf("%.3f", survivor_relative$theta[which.min(survivor_relative$relative_cost)])`**.
+This last value is descriptive: selecting it after inspecting validation results
+would require another fresh sample before claiming an optimized performance gain.
+The comparison directly measures whether earlier stopping compensates for less
+favorable weights, rather than assuming that the strongest tilt is best.
+
+## Reproducibility
+
+Pilot: 150,000 paths × five repetitions per tilt/method (3101; crude 3501).
+Independent validation: 150,000 × five per configuration (3701 + 100 × configuration
+index, with per-job offsets). Reference: 200,000 (3801). Profiling: 4101.
+Line-level diagnostics: 50 batches of 50,000 paths per method at -0.30, seeds
+4201–4203. Improved-estimator efficiency comparison: pilot 7101, independent
+benchmark 7201, independent probability reference 7301. Timing is inherently machine-dependent; rerendering deliberately repeats it.
+
+```{r}
+#| label: performance-session
+sessionInfo()
+```
