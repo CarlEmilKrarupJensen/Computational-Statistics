@@ -20,7 +20,7 @@ the statistical companion report.
 #| label: setup
 # The Quarto project sets the execution directory to the assignment root.
 for (file in c("model.R", "theory.R", "simulation.R", "importance_sampling.R", "experiments.R", "stopped_survivors.R")) {
-  source(file.path("project_A", file), keep.source = TRUE)
+  source(file.path("project_B", file), keep.source = TRUE)
 }
 library(ggplot2)
 knitr::opts_chunk$set(fig.width = 8, fig.height = 5, digits = 4)

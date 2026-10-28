@@ -10,14 +10,14 @@ $X_j\sim U(-1.9,2)$, and $\tau=\inf\{k\ge1:S_k\le0\}$.
 The computational question is whether the tilt minimizing variance per trajectory
 also minimizes the computing time needed for a given precision. We compare crude
 Monte Carlo, full-path importance sampling, and stopped-path importance sampling.
-All simulation algorithms live in `project_A/`; the code below organizes experiments.
+All simulation algorithms live in `project_B/`; the code below organizes experiments.
 The horizon is always 100 and initial capital is always 30 unless stated otherwise.
 
 ```{r}
 #| label: setup
 # The Quarto project sets the execution directory to the assignment root.
 for (file in c("model.R", "theory.R", "simulation.R", "importance_sampling.R", "experiments.R")) {
-  source(file.path("project_A", file))
+  source(file.path("project_B", file))
 }
 library(ggplot2)
 knitr::opts_chunk$set(fig.width = 8, fig.height = 5, digits = 4)
@@ -207,7 +207,7 @@ $f$, whereas both IS methods simulate under $g_\theta$.
 ### Reading the actual simulation function
 
 The following is the actual source of `estimate_ruin()` in
-`project_A/importance_sampling.R`. Its loop updates many independent paths at
+`project_B/importance_sampling.R`. Its loop updates many independent paths at
 once; each element of its vectors refers to one trajectory. This saves R loop
 overhead while preserving the usual step-by-step random-walk construction.
 
@@ -215,7 +215,7 @@ overhead while preserving the usual step-by-step random-walk construction.
 #| label: show-estimator-source
 #| echo: false
 #| results: asis
-estimator_source <- readLines(file.path("project_A", "importance_sampling.R"))
+estimator_source <- readLines(file.path("project_B", "importance_sampling.R"))
 estimator_start <- grep("^estimate_ruin <- function", estimator_source)
 cat("```r\n", paste(estimator_source[estimator_start:length(estimator_source)],
                          collapse = "\n"), "\n```\n", sep = "")

@@ -18,7 +18,7 @@ statistical estimator and its variance are unchanged.
 ```{r}
 #| label: comparison-setup
 for (file in c("model.R", "importance_sampling.R", "stopped_survivors.R")) {
-  source(file.path("project_A", file))
+  source(file.path("project_B", file))
 }
 library(ggplot2)
 if (!requireNamespace("ggbeeswarm", quietly = TRUE)) {
@@ -57,7 +57,7 @@ We use 150,000 paths per batch and 15 repetitions at each of four tilts:
 order. Each original/improved pair uses the same seed and random draws. Warm-up,
 garbage collection, seed initialization, and equality checks are outside timing.
 Every pair also verifies exact summary equality. All reusable code lives in
-`project_A/stopped_survivors.R`.
+`B/stopped_survivors.R`.
 
 ```{r}
 #| label: comparison-benchmark

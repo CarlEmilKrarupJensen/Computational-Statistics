@@ -93,7 +93,7 @@ profile_method <- function(method, theta, n = 20000, seconds = 2,
 # Profile fixed batches by source line; return times joined to the actual R code.
 # Source modules with keep.source=TRUE before calling, so R retains line locations.
 profile_source_lines <- function(method, theta, n = 50000, batches = 50,
-                                 seed = 4201, source_dir = "project_A",
+                                 seed = 4201, source_dir = "project_B",
                                  file = tempfile(fileext = ".out")) {
   stopifnot(batches >= 1, batches == as.integer(batches))
   if (is.null(attr(estimate_ruin, "srcref"))) {
