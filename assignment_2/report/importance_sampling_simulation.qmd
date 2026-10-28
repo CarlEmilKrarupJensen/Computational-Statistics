@@ -1,0 +1,490 @@
+---
+title: "Finite-horizon ruin: statistical precision and exponential tilting"
+subtitle: "Assignment 2b · Numerical investigation"
+---
+
+## Question and experimental design
+
+We estimate $p=P(\tau\le100)$ for $S_k=30+\sum_{j=1}^kX_j$ with independent
+$X_j\sim U(-1.9,2)$, and $\tau=\inf\{k\ge1:S_k\le0\}$.
+The computational question is whether the tilt minimizing variance per trajectory
+also minimizes the computing time needed for a given precision. We compare crude
+Monte Carlo, full-path importance sampling, and stopped-path importance sampling.
+All simulation algorithms live in `project_A/`; the code below organizes experiments.
+The horizon is always 100 and initial capital is always 30 unless stated otherwise.
+
+```{r}
+#| label: setup
+# The Quarto project sets the execution directory to the assignment root.
+for (file in c("model.R", "theory.R", "simulation.R", "importance_sampling.R", "experiments.R")) {
+  source(file.path("project_A", file))
+}
+library(ggplot2)
+knitr::opts_chunk$set(fig.width = 8, fig.height = 5, digits = 4)
+theta_example <- -0.30  # Illustrative tilt; no optimality is assumed.
+theta_grid <- seq(-0.65, -0.05, by = 0.05)
+```
+
+
+## Understanding the random walk
+
+The original drift is $E[X]=0.05$, so expected capital increases slightly. Ruin
+requires a substantial downward excursion. It is a first-passage event: a path can
+cross zero and recover to positive capital by step 100. Consequently,
+$\{S_{100}\le0\}\subseteq\{\tau\le100\}$, generally with strict inclusion.
+
+```{r}
+#| label: original-paths
+#| fig-cap: "Original random walks; color records whether the path ever crosses zero."
+set.seed(1101)
+original <- simulate_paths(1000)
+path_data <- data.frame(path = rep(seq_len(1000), each = 101),
+                        time = rep(0:100, 1000),
+                        capital = as.vector(t(original$paths)),
+                        ruined = rep(is.finite(original$ruin_times), each = 101))
+ggplot(path_data, aes(time, capital, group = path, color = ruined)) +
+  geom_line(alpha = 0.18, linewidth = 0.3) + geom_hline(yintercept = 0) +
+  labs(title = "Ruin concerns the whole trajectory", x = "Step", y = "Capital", color = "Ruin") +
+  theme_minimal()
+knitr::kable(data.frame(paths = 1000,
+  ruin_frequency = mean(is.finite(original$ruin_times)),
+  nonpositive_final_frequency = mean(original$paths[, 101] <= 0),
+  ruined_then_recovered = sum(is.finite(original$ruin_times) & original$paths[, 101] > 0)))
+```
+
+These frequencies use only 1,000 paths (seed 1101) for illustration. They are not
+our final probability estimates.
+
+## Exponential tilting
+
+Write $M(\theta)=E[e^{\theta X}]=\varphi(\theta)/3.9$ and
+$K(\theta)=\log M(\theta)$. Then
+$g_\theta(x)=e^{\theta x}/\varphi(\theta)$ on the original support.
+Negative $\theta$ shifts mass toward losses. At zero, $\varphi(0)=3.9$ and the
+original uniform distribution is recovered. Our implementation uses the centered
+support identity $M(\theta)=e^{0.05\theta}\sinh(1.95\theta)/(1.95\theta)$
+and series expansions near zero to avoid cancellation.
+
+```{r}
+#| label: tilted-densities
+#| fig-cap: "Negative tilts assign more density to negative increments."
+densities <- expand.grid(x = seq(-1.9, 2, length.out = 400), theta = c(-0.6, -0.3, 0, 0.3))
+densities$density <- mapply(tilted_density, densities$x, densities$theta)
+ggplot(densities, aes(x, density, color = factor(theta))) + geom_line() +
+  labs(title = "Exponential tilt of the increment distribution", x = "Increment", y = "Density", color = expression(theta)) + theme_minimal()
+```
+
+```{r}
+#| label: tilted-paths
+#| fig-cap: "Independent path samples under three simulation distributions (seed 1102)."
+set.seed(1102)
+path_groups <- lapply(c(0, theta_example, -0.55), function(theta) {
+  result <- simulate_paths(100, theta)
+  data.frame(time = rep(0:100, 100), capital = as.vector(t(result$paths)),
+             path = rep(1:100, each = 101), theta = sprintf("theta = %.3f", theta))
+})
+ggplot(do.call(rbind, path_groups), aes(time, capital, group = path)) +
+  geom_line(alpha = 0.15, color = "steelblue") + geom_hline(yintercept = 0) +
+  facet_wrap(~theta) + labs(title = "Making ruin more typical", x = "Step", y = "Capital") + theme_minimal()
+```
+
+Ruin frequencies measured under $g_\theta$ estimate $P_\theta(\tau\le100)$,
+not the desired $P(\tau\le100)$. Likelihood ratios correct this change of measure.
+All densities are positive on the same support, so the reweighting preserves
+unbiasedness.
+
+### Expected capital under different simulation settings
+
+The tilted mean helps explain how the simulation changes: a more negative drift
+makes ruin more frequent and may allow paths to stop earlier. These are descriptive
+settings, not theoretically selected optima. We select parameters empirically from
+variance and timing measurements below and in the performance report.
+
+```{r}
+#| label: expected-capital
+#| fig-cap: "Expected capital paths for illustrative tilts; optimality is assessed empirically."
+expected <- expand.grid(time = 0:100, theta = c(0, theta_example, -0.55))
+expected$capital <- 30 + expected$time * tilted_mean(expected$theta)
+ggplot(expected, aes(time, capital, color = factor(round(theta, 3)))) +
+  geom_line(linewidth = 1) + geom_hline(yintercept = 0) +
+  labs(title = "Expected capital under alternative tilts", x = "Step", y = "Expected capital", color = expression(theta)) + theme_minimal()
+```
+
+## From the mathematical estimators to the R code
+
+### What is one simulated observation?
+
+The time horizon and the Monte Carlo sample size play different roles. In the
+mathematics, $n=100$ is the number of possible **time steps**, while $N$ is the
+number of independent **trajectories**. In the R interface, the argument `n`
+means the number of trajectories, so **R's `n` corresponds to mathematical $N$**;
+`horizon` corresponds to mathematical $n$. For example,
+
+```r
+estimate_ruin(n = 100000, horizon = 100, theta = theta_example, method = "full")
+```
+
+means 100,000 independent paths, each simulated for 100 steps. It does not mean
+one path of length 100,000. The default initial capital is 30.
+
+To distinguish increments from estimator contributions, write
+$Y^{(i)}=(Y_1^{(i)},\ldots,Y_{100}^{(i)})$ for tilted trajectory $i$ and
+$Z_i$ for its single contribution to the estimate. Its capital is
+$S_k^{(i)}=30+\sum_{j=1}^kY_j^{(i)}$. Define
+$$
+A_{100}^{(i)}=\left\{\min_{1\le k\le100}S_k^{(i)}\le0\right\}
+             =\{\tau_i\le100\}.
+$$
+We average **one contribution per trajectory**, including zeros from paths
+without ruin. Averaging only over ruined paths would change the estimator and
+would generally be biased for the desired probability.
+
+### From a density ratio to a likelihood weight
+
+For one increment, $f(x)=1/3.9$ and
+$g_\theta(x)=e^{\theta x}/\varphi(\theta)$ on $[-1.9,2]$.
+The individual increments are independent with density $g_\theta$; the joint
+density of the vector of its first $m$ increments is
+$$
+g_{\theta,m}(y_1,\ldots,y_m)
+=\prod_{k=1}^m g_\theta(y_k)
+=\varphi(\theta)^{-m}\exp\left(\theta\sum_{k=1}^m y_k\right).
+$$
+Both joint densities are zero outside $[-1.9,2]^m$. On this support,
+$$
+\begin{aligned}
+L_m
+&=\frac{f_m(y_1,\ldots,y_m)}{g_{\theta,m}(y_1,\ldots,y_m)}\\
+&=\prod_{k=1}^m\frac{1/3.9}{e^{\theta y_k}/\varphi(\theta)}\\
+&=\left(\frac{\varphi(\theta)}{3.9}\right)^m
+  \exp\left(-\theta\sum_{k=1}^m y_k\right).
+\end{aligned}
+$$
+Rather than multiplying many ratios, the code takes logarithms:
+$$
+\log L_m
+=m\underbrace{\log(\varphi(\theta)/3.9)}_{K(\theta)}
+ -\theta\underbrace{\sum_{k=1}^m y_k}_{S_m-30}.
+$$
+This is the exact function used by the simulation, displayed directly from the
+loaded module rather than implemented again in this report:
+
+```{r}
+#| label: show-log-likelihood-function
+#| echo: false
+#| results: asis
+cat("```r\nlog_likelihood_ratio <- ",
+    paste(deparse(log_likelihood_ratio), collapse = "\n"), "\n```\n", sep = "")
+```
+
+Here `steps` is $m$, `log_mgf(theta)` is $K(\theta)$, and `increment_sum` is
+$S_m-30$. The function returns **$\log L_m$**, so the simulation subsequently
+uses `exp(...)` to recover $L_m$. Although the function name contains “MGF,”
+`log_mgf` returns its logarithm, not $M(\theta)$ and not $\log\varphi(\theta)$.
+The factor $3.9$ has already been accounted for through $M=\varphi/3.9$.
+
+### The three estimators implemented by `estimate_ruin()`
+
+| Method argument | Distribution of increments | Contribution $Z_i$ | Steps actually simulated |
+|:--|:--|:--|:--|
+| `"crude"` | Original uniform $f$ | $\mathbf1_{A_{100}^{(i)}}$ | 100 |
+| `"full"` | Tilted density $g_\theta$ | $\mathbf1_{A_{100}^{(i)}}L_{100}^{(i)}$ | 100 |
+| `"stopped"` | Tilted density $g_\theta$ | $\mathbf1_{A_{100}^{(i)}}L_{T_i}^{(i)}$, $T_i=\min(\tau_i,100)$ | $T_i$ |
+
+In all three cases,
+$$
+\hat p=\frac1N\sum_{i=1}^N Z_i.
+$$
+On a ruined path, $T_i=\tau_i$, so the stopped contribution uses $L_{\tau_i}$.
+On a path without ruin, $T_i=100$ but the contribution is zero. Writing the weight
+as $L_{T_i}$ avoids trying to evaluate $L_\tau$ when $\tau=\infty$.
+
+The crude method sets `theta <- 0`. Then `r_tilted()` generates uniform
+increments, $K(0)=0$, and $L_m=\exp(0)=1$. Thus the same weighting code reduces
+automatically to the usual zero-or-one indicator. Crude MC is simulated under
+$f$, whereas both IS methods simulate under $g_\theta$.
+
+### Reading the actual simulation function
+
+The following is the actual source of `estimate_ruin()` in
+`project_A/importance_sampling.R`. Its loop updates many independent paths at
+once; each element of its vectors refers to one trajectory. This saves R loop
+overhead while preserving the usual step-by-step random-walk construction.
+
+```{r}
+#| label: show-estimator-source
+#| echo: false
+#| results: asis
+estimator_source <- readLines(file.path("project_A", "importance_sampling.R"))
+estimator_start <- grep("^estimate_ruin <- function", estimator_source)
+cat("```r\n", paste(estimator_source[estimator_start:length(estimator_source)],
+                         collapse = "\n"), "\n```\n", sep = "")
+```
+
+Read the function in four stages:
+
+1. **Initialize the paths.** `capital <- rep(initial_capital, n)` sets all
+   $S_0^{(i)}=30$. `times <- rep(Inf, n)` means no crossing has yet been observed.
+   This `Inf` is a bookkeeping value, not a claim that the path can never ruin
+   after the finite horizon. `steps` stores how many increments were generated.
+2. **Generate increments and update capital.** At step `k`,
+   `r_tilted(length(active), theta, lower, upper)` draws one independent increment
+   for every active path. Adding this vector to `capital[active]` implements
+   $S_k^{(i)}=S_{k-1}^{(i)}+Y_k^{(i)}$. `newly_ruined` identifies paths with
+   current capital at or below zero and no previously recorded crossing;
+   `times[newly_ruined] <- k` therefore records the **first** ruin time.
+3. **Choose whether to continue after ruin.** For `"full"` and `"crude"`,
+   `active` contains all trajectory indices at every step. They retain their
+   recorded ruin time even if they later recover. For `"stopped"`,
+   `which(is.infinite(times))` selects only paths without a recorded crossing.
+   A ruined path receives no further increments, so its final stored capital
+   is $S_\tau$ and its `steps` value is $\tau$.
+4. **Construct $Z_i$.** `ruined <- is.finite(times)` represents the event
+   indicator. `contributions <- numeric(n)` initializes all $Z_i=0$.
+   Only `contributions[ruined]` are replaced by likelihood weights. The argument
+   `capital[ruined] - initial_capital` supplies $\sum_{k=1}^mY_k$; `steps[ruined]`
+   supplies $m$. These are terminal sums and $m=100$ for full paths, and sums
+   through ruin and $m=\tau$ for stopped paths. Finally,
+   `summarize_contributions()` averages all $N$ contributions.
+
+| Mathematical object | R variable or expression |
+|:--|:--|
+| Number of independent trajectories $N$ | `n` |
+| Horizon $n=100$ | `horizon` |
+| Current $S_k^{(i)}$, or frozen $S_{\tau_i}^{(i)}$ after stopping | `capital[i]` |
+| First observed ruin time $\tau_i\le100$ | `times[i]`; otherwise `Inf` |
+| $\mathbf1_{\{\tau_i\le100\}}$ | `as.numeric(ruined[i])` |
+| Number of simulated increments $m_i$ | `steps[i]` |
+| $\sum_{k=1}^{m_i}Y_k^{(i)}$ | `capital[i] - initial_capital` after the loop |
+| $Z_i=\mathbf1_{\{\tau_i\le100\}}L_{m_i}$ | `contributions[i]` |
+| $\hat p=N^{-1}\sum_iZ_i$ | `mean(contributions)` |
+
+### Worked path: ruin followed by recovery
+
+For a transparent numerical example only, reduce initial capital to 2 and the
+horizon to 4. Consider increments $(-0.8,-1.4,1.0,0.6)$ and tilt $\theta=-0.3$.
+This is a deterministic example of the calculation, not an estimate of the
+original 100-step ruin probability.
+
+```{r}
+#| label: worked-path-capital
+example_increments <- c(-0.8, -1.4, 1.0, 0.6)
+example_capital <- 2 + c(0, cumsum(example_increments))
+example_tau <- ruin_times(matrix(example_increments, nrow = 1), initial_capital = 2)[1]
+knitr::kable(data.frame(step = 0:4, increment = c(NA, example_increments),
+                        capital = example_capital), digits = 3)
+```
+
+Ruin occurs at step **`r example_tau`**, although final capital is
+**`r tail(example_capital, 1)`**. Thus the indicator is one for both IS methods.
+The full method keeps all four increments; the stopped method uses only the
+first two. The next table computes each weight both from the formula for
+$\log L_m$ and by directly multiplying the one-increment density ratios.
+
+```{r}
+#| label: worked-path-weights
+example_theta <- -0.3
+example_steps <- c(4, example_tau)
+example_sums <- c(sum(example_increments), sum(example_increments[seq_len(example_tau)]))
+example_log_weights <- log_likelihood_ratio(example_sums, example_steps, example_theta)
+example_density_ratios <- c(
+  prod(uniform_density(example_increments) / tilted_density(example_increments, example_theta)),
+  prod(uniform_density(example_increments[seq_len(example_tau)]) /
+         tilted_density(example_increments[seq_len(example_tau)], example_theta)))
+knitr::kable(data.frame(method = c("Full", "Stopped"), steps = example_steps,
+                        increment_sum = example_sums, log_weight = example_log_weights,
+                        contribution = exp(example_log_weights),
+                        direct_density_ratio = example_density_ratios), digits = 6)
+stopifnot(isTRUE(all.equal(exp(example_log_weights), example_density_ratios)))
+```
+
+The two columns agree because they evaluate the same density ratio in different
+ways. A weight, and hence an individual IS contribution, can exceed one; it is
+not itself a probability. On a path with no ruin the contribution would instead
+be zero, irrespective of its likelihood weight. For crude MC this ruined path
+would contribute one. The full and stopped weights need not agree for an
+individual path: their **expectations** agree with the target probability.
+
+### From individual contributions to the reported estimate and standard error
+
+For independent contributions $Z_1,\ldots,Z_N$, the output quantities are
+$$
+\hat p=\bar Z,\qquad
+s_Z^2=\frac1{N-1}\sum_{i=1}^N(Z_i-\bar Z)^2,\qquad
+\widehat{\operatorname{Var}}(\hat p)=\frac{s_Z^2}{N},\qquad
+\widehat{\mathrm{SE}}(\hat p)=\sqrt{\frac{s_Z^2}{N}}.
+$$
+Here `var(contributions)` calculates $s_Z^2$, the estimated variance of **one
+trajectory's contribution**, whereas `var(contributions) / n` estimates the
+variance of the **average**. This distinction accounts for the factor $N$.
+The relative standard error is $\widehat{\mathrm{SE}}/\hat p$.
+
+The small diagnostic run below exposes the actual contributions returned by the
+reusable function. Twelve paths are enough to explain the calculation, but far
+too few for the final statistical investigation.
+
+```{r}
+#| label: inspect-individual-contributions
+set.seed(1201)
+diagnostic_run <- estimate_ruin(n = 12, theta = theta_example, method = "stopped",
+                                 diagnostics = TRUE)
+knitr::kable(data.frame(trajectory = 1:12,
+                        ruin_time = diagnostic_run$ruin_times,
+                        simulated_steps = diagnostic_run$steps,
+                        contribution = diagnostic_run$contributions), digits = 6)
+```
+
+```{r}
+#| label: reconstruct-estimate
+knitr::kable(data.frame(
+  calculation = c("mean(contributions)", "var(contributions)",
+                  "var(contributions) / N", "sqrt(var(contributions) / N)"),
+  value = c(mean(diagnostic_run$contributions), var(diagnostic_run$contributions),
+            var(diagnostic_run$contributions) / 12,
+            sqrt(var(diagnostic_run$contributions) / 12))), digits = 8)
+knitr::kable(diagnostic_run$summary[, c("estimate", "contribution_variance",
+                                       "estimator_variance", "standard_error")], digits = 8)
+stopifnot(isTRUE(all.equal(mean(diagnostic_run$contributions),
+                          diagnostic_run$summary$estimate)))
+```
+
+The manually reconstructed values match the returned summary. In contrast,
+`ruin_frequency` is `mean(is.finite(ruin_times))`: under a nonzero tilt it
+estimates $P_\theta(\tau\le100)$, **not** the weighted target $p$.
+The final experiments below use much larger samples and approximate 95% normal
+intervals $\hat p\pm1.96\widehat{\mathrm{SE}}$ without truncation. Such intervals
+can be unreliable when ruin observations or representative weighted observations
+are too few; the tiny diagnostic example is not used for final inference.
+
+### Why both importance sampling estimators are unbiased
+
+For a full path, change of measure gives
+$$
+E_\theta[Z_F]
+=\int\mathbf1_{A_{100}}(y)\frac{f_{100}(y)}{g_{\theta,100}(y)}
+ g_{\theta,100}(y)\,dy
+=\int\mathbf1_{A_{100}}(y)f_{100}(y)\,dy=p.
+$$
+The stopped estimator has the same expectation for a different reason than
+merely replacing 100 by a shorter path length: its stopping time depends on the
+observed increments, and that dependence must be respected.
+
+Set $T=\tau\wedge100$. Under $P_\theta$, the likelihood process is a martingale
+because each next density ratio has expectation
+$E_\theta[f(Y)/g_\theta(Y)]=1$. On a ruined path, the remaining full-path weight
+is a product of independent future density ratios with conditional mean one.
+On a non-ruined path, both contributions are zero. Therefore,
+$$
+E_\theta[Z_F\mid\mathcal F_T]=Z_S.
+$$
+Taking expectations proves $E_\theta[Z_S]=p$. This conditional-expectation
+identity also makes the stopped contribution a Rao–Blackwellization of the full
+contribution. By the law of total variance,
+$$
+\operatorname{Var}_\theta(Z_F)
+=\operatorname{Var}_\theta(Z_S)
+ +E_\theta[\operatorname{Var}_\theta(Z_F\mid\mathcal F_T)]
+\ge\operatorname{Var}_\theta(Z_S).
+$$
+Thus stopping removes post-ruin likelihood noise without changing the target.
+This ordering holds at any **common** tilt; it does not force the two variance
+curves to have the same minimizing tilt, nor does it guarantee that every pair
+of noisy empirical variances will be ordered.
+
+## Pilot selection and sensitivity
+
+The grid covers moderate through strong negative tilts, from -0.65 to -0.05
+in steps of 0.05. Independent simulations at each grid point use seed 2101, with 5,000
+and 20,000 paths. The 20,000-path pilot chooses the smallest empirical
+contribution variance separately for each estimator. This is a grid search, not
+an assertion about a continuous global optimum.
+
+```{r}
+#| label: pilot-variance
+#| fig-cap: "Variance of an individual weighted contribution across candidate tilts."
+pilot <- variance_experiment(theta_grid, c(5000, 20000), seed = 2101)
+selected <- select_theta(subset(pilot, n == 20000))
+ggplot(pilot, aes(theta, contribution_variance, color = method)) +
+  geom_line() + geom_point() + facet_wrap(~n, labeller = label_both) +
+  scale_y_log10() + labs(title = "Variance sensitivity to tilt and pilot size", x = expression(theta),
+                         y = "Contribution variance (log scale)") + theme_minimal()
+knitr::kable(selected[, c("method", "theta", "contribution_variance")], row.names = FALSE)
+```
+
+```{r}
+#| label: ruin-frequency
+#| fig-cap: "Ruin frequency under the simulation law, estimated with 20,000 paths per point."
+ggplot(subset(pilot, n == 20000), aes(theta, ruin_frequency, color = method)) +
+  geom_line() + geom_point() +
+  labs(title = "Stronger negative tilts make ruin frequent", x = expression(theta), y = "Simulation ruin frequency") + theme_minimal()
+```
+
+Selecting the lowest noisy point creates selection optimism. Flat minima,
+grid resolution, and occasionally large likelihood contributions can make the
+selected parameter unstable. Agreement across these two sizes is only a limited
+sensitivity check. Repeated pilots or a finer local grid would strengthen the
+claim; extremely negative tilts are especially vulnerable to unstable second-moment
+estimates. A strong tilt making almost every path ruin is not automatically efficient.
+
+## Independent final evaluation
+
+We now discard the pilot samples for evaluation and use seed 2201 with 100,000
+new trajectories for each configuration. The fixed illustrative tilt (-0.30) and
+pilot-selected tilts are evaluated separately, even if their values coincide.
+The common fixed tilt permits a direct full-versus-stopped comparison. Standard errors below describe final
+Monte Carlo uncertainty conditional on the chosen parameters, not pilot-selection
+uncertainty.
+
+```{r}
+#| label: final-estimation
+set.seed(2201)
+configurations <- data.frame(method = c("crude", "full", "stopped", "full", "stopped"),
+  choice = c("Original", "Fixed example", "Fixed example", "Pilot variance minimum", "Pilot variance minimum"),
+  theta = c(0, theta_example, theta_example,
+            selected$theta[selected$method == "full"], selected$theta[selected$method == "stopped"]))
+final_rows <- lapply(seq_len(nrow(configurations)), function(i) {
+  cbind(configurations[i, ], estimate_ruin(100000, configurations$theta[i], configurations$method[i])$summary)
+})
+final <- do.call(rbind, final_rows)
+knitr::kable(final[, c("method", "choice", "theta", "estimate", "standard_error", "ci_lower", "ci_upper")], digits = 6, row.names = FALSE)
+knitr::kable(final[, c("method", "choice", "contribution_variance", "estimator_variance", "relative_standard_error", "ruin_frequency")], digits = 6, row.names = FALSE)
+```
+
+```{r}
+#| label: final-precision
+#| fig-cap: "Independent final estimates with approximate 95% Monte Carlo intervals."
+final$configuration <- paste(final$method, final$choice, sep = ": ")
+ggplot(final, aes(estimate, configuration)) + geom_point() +
+  geom_errorbar(aes(xmin = ci_lower, xmax = ci_upper), orientation = "y", width = 0.15) +
+  labs(title = "Equal-size final simulations", x = "Ruin probability", y = NULL) + theme_minimal()
+```
+
+## Interpretation
+
+The selected grid minima are
+**`r round(selected$theta[selected$method == "full"], 4)`** for full paths and
+**`r round(selected$theta[selected$method == "stopped"], 4)`** for stopped paths.
+These are empirical optima for the tested grid. Nearby values should not be treated
+as meaningfully different without stronger simulation evidence.
+
+At the common illustrative tilt (-0.30), the final empirical full/stopped variance ratio is
+**`r round(final$contribution_variance[2] / final$contribution_variance[3], 2)`**.
+Relative to crude MC, stopped IS at its selected tilt has a contribution-variance
+reduction factor of **`r round(final$contribution_variance[1] / final$contribution_variance[5], 2)`**.
+Importance sampling improves precision by observing useful ruin trajectories more
+frequently and reweighting them correctly. Excessively strong tilting can instead
+produce highly uneven weights. Stopping removes irrelevant post-ruin weight
+variation through conditional expectation, and also saves increments. The exact
+variance ordering does not imply the two variance curves have identical minima.
+The companion report evaluates whether saved increments translate to lower
+wall-clock cost and whether that changes the preferred tilt.
+
+## Reproducibility
+
+Seeds: 1101 (original paths), 1102 (tilted paths), 2101 (pilot), 2201 (final).
+The tables state sample sizes; no saved interactive objects are required.
+
+```{r}
+#| label: session-information
+sessionInfo()
+```
