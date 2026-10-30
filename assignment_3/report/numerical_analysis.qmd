@@ -1,0 +1,402 @@
+---
+title: "Student's t: EM, robustness and information"
+format:
+  html:
+    embed-resources: true
+execute:
+  cache: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+for (file in c("model", "complete_data", "em", "optimization", "fisher_information", "simulation", "experiments")) {
+  source(file.path("..", "project_A", paste0(file, ".R")))
+}
+library(ggplot2)
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, fig.width=9, fig.height=5.5)
+```
+
+## Model and derivation
+
+Write $v=\sigma^2$. The scale squared $v$ is not the variance: the latter is
+$\nu v/(\nu-2)$ for $\nu>2$ and is undefined for $\nu\le2$.
+With $W\sim\chi^2_\nu$ and $X\mid W=w\sim N(\mu,\nu v/w)$, multiplying the two densities gives
+$$
+f(x,w)=\frac{w^{(\nu-1)/2}\exp\{-w[1+(x-\mu)^2/(\nu v)]/2\}}
+{\sqrt{\pi\nu v}\,2^{(\nu+1)/2}\Gamma(\nu/2)}.
+$$
+Use $\int_0^\infty w^{a-1}e^{-bw}\,dw=\Gamma(a)/b^a$, with
+$a=(\nu+1)/2$ and $b=[1+(x-\mu)^2/(\nu v)]/2$, to obtain
+$$
+f(x)=\frac{\Gamma((\nu+1)/2)}{\Gamma(\nu/2)\sqrt{\pi\nu v}}
+\left[1+\frac{(x-\mu)^2}{\nu v}\right]^{-(\nu+1)/2}.
+$$
+Thus $X=\mu+\sqrt v\,T_\nu$. In `model.R`, `t_loglik()` sums the log of this density using R's `dt()`.
+
+For $n$ complete pairs the log-likelihood is
+$$
+\ell_c=-\frac n2\log(\pi\nu v)-\frac{n(\nu+1)}2\log2-n\log\Gamma(\nu/2)
++\frac{\nu-1}2\sum_i\log w_i-\frac12\sum_iw_i
+-\frac1{2\nu v}\sum_iw_i(x_i-\mu)^2.
+$$
+Only $-n\log v/2-\sum_iw_i(x_i-\mu)^2/(2\nu v)$ depends on the unknown parameters.
+Differentiating gives the unique positive-scale maximum for nonconstant data:
+$$
+\hat\mu_c=\frac{\sum_iw_ix_i}{\sum_iw_i},\qquad
+\hat v_c=\frac1{n\nu}\sum_iw_i(x_i-\hat\mu_c)^2.
+$$
+The weighted sum of squares is minimized at $\hat\mu_c$; maximizing over $v$ then gives $\hat v_c$.
+`complete_data_mle()` implements these formulas.
+
+The conditional density has the same kernel in $w$:
+$$
+W_i\mid X_i=x_i\sim\operatorname{Gamma}\left(\frac{\nu+1}2,
+\text{rate}=\frac{1+(x_i-\mu)^2/(\nu v)}2\right).
+$$
+The E-step therefore replaces $w_i$ by
+$$
+\omega_i=E(W_i\mid x_i)=\frac{\nu+1}{1+(x_i-\mu)^2/(\nu v)}.
+$$
+For fixed $\nu$, terms involving $E(\log W_i\mid x_i)$ do not affect maximization over $(\mu,v)$.
+The M-step uses the complete-data formulas with these expected weights:
+$$
+\mu^{(t+1)}=\frac{\sum_i\omega_i^{(t)}x_i}{\sum_i\omega_i^{(t)}},\qquad
+v^{(t+1)}=\frac{\sum_i\omega_i^{(t)}(x_i-\mu^{(t+1)})^2}{n\nu}.
+$$
+`em_step()` expresses this correspondence directly. The scale update uses the new location.
+`fit_em()` records the starting likelihood and every subsequent likelihood, checks monotonicity,
+and requires both a relative likelihood change and the dimensionless mean score to be at most $10^{-7}$.
+
+## Basic validation
+
+We use $n=1000$, $\mu=1$, $v=2$, $\nu=5$, seed 405. All optimizers start at the sample median
+and squared half-IQR; starts are supplied as $(\mu,\log v)$.
+
+```{r}
+x <- simulate_t_data(1000,1,2,5,seed=405)
+fits <- fit_all(x,5)
+knitr::kable(fit_table(fits),digits=7)
+h <- fits$EM$history
+ggplot(h,aes(iteration,loglik))+geom_line()+labs(title="EM marginal log-likelihood",y="Log-likelihood")
+```
+
+```{r}
+cat(sprintf("The largest likelihood difference is %.3g; the smallest EM increment is %.3g. All fits passed the common score check: %s.",
+ diff(range(sapply(fits,`[[`,"loglik"))),min(diff(h$loglik)),all(sapply(fits,`[[`,"converged"))))
+```
+
+Finite-sample estimates need not equal the simulation parameters. Agreement between optimizers
+checks numerical optimization; it does not prove statistical unbiasedness or global optimality.
+
+## Contamination: separating model robustness from optimizer reliability
+
+### What the weights explain
+
+The Student's $t$ model downweights large standardized residuals. The relative latent weight
+$E(W\mid x)/\nu$ approaches one as $\nu\to\infty$ at a fixed residual, whereas small $\nu$ downweights
+remote observations more strongly. This is a property of the **statistical model**, not an advantage
+of one optimizer. EM, BFGS and Newton should give the same estimates when they find the same maximum.
+
+```{r}
+weight_grid <- expand.grid(residual=seq(-15,15,length.out=401),nu=c(2,5,30))
+weight_grid$weight <- with(weight_grid,(nu+1)/(1+residual^2/nu)/nu)
+ggplot(weight_grid,aes(residual,weight,color=factor(nu)))+geom_line(linewidth=.8)+
+ labs(title="How the fitted t model downweights remote observations",x="Standardized residual",
+ y="Relative conditional weight: E(W | x) / nu",color="Fixed nu")+
+ theme_minimal(base_size=12)
+```
+
+### A paired experiment comparing the optimizers
+
+We replace the previous single-outlier illustration with a repeated experiment that asks:
+**does contamination change the speed or reliability of EM, BFGS and Newton?**
+
+Generate 100 independent clean baseline samples of size $n=500$ from $t_5$ with $\mu=0$ and
+$\sigma=1$ (dataset seed $47000+b$). For each baseline, randomly order observation positions and
+independently generate replacement values from $N(15,1)$. Replace exactly 0, 5 or 25 observations,
+corresponding to 0%, 1% and 5% contamination. Positions and replacement values are nested: the
+first five replacements at 5% are exactly those at 1%. Sample size is fixed. We average over
+100 baselines rather than interpreting the signed effect of removing one arbitrary observation.
+
+Fit each resulting dataset under fixed $\nu=2,5,30$ using **all three optimizers**. For a given
+baseline and contamination level, every model and optimizer sees the same data. The clean generating
+model is always $t_5$; fitting $\nu=2$ or 30 represents a different tail assumption, not a newly generated
+dataset. One-sided outliers are a deliberately specified stress scenario, not a model for every kind
+of real contamination. No coverage claims based on correctly specified Fisher information are made here.
+
+We use two starts shared by all methods: the sample median and half-IQR scale, and a displaced
+location five such scale units away with half that initial scale. Both are recomputed from the
+current contaminated sample. Thus changing contamination includes its practical effect on data-based
+initialization. The displaced-start comparison holds the dataset fixed. All fits use score tolerance
+$10^{-7}$ and maximum iteration budget 200, for 5,400 attempted fits. The computational report gives
+runtime distributions and failure-rate plots; here we check that the methods still target the same estimates.
+
+```{r}
+#| label: contamination-study
+#| include: false
+contamination <- run_contamination_study(cache_file="results/contamination.rds",source_dir="../project_A")
+contamination_performance <- contamination_summary(contamination)
+contamination_checks <- contamination_agreement(contamination)
+```
+
+```{r}
+agreement_table <- do.call(rbind,lapply(split(contamination_checks,
+ interaction(contamination_checks[c("nu","percent")],drop=TRUE)),function(g) {
+ data.frame(nu=g$nu[1],contamination_percent=g$percent[1],datasets=nrow(g),
+ all_six_certified=sum(g$certified==6),at_least_one_certified=sum(g$certified>0),
+ max_mu_spread=max(g$mu_spread,na.rm=TRUE),max_sigma_spread=max(g$sigma_spread,na.rm=TRUE),
+ max_loglik_spread=max(g$loglik_spread,na.rm=TRUE))
+}))
+agreement_table <- agreement_table[order(agreement_table$nu,agreement_table$contamination_percent),]
+for(column in c("max_mu_spread","max_sigma_spread","max_loglik_spread"))
+ agreement_table[[column]] <- formatC(agreement_table[[column]],format="e",digits=2)
+knitr::kable(agreement_table,row.names=FALSE,
+ caption="Agreement across certified methods and starts, within the same dataset and fitted nu. Six fits = three methods × two starts.")
+```
+
+`all_six_certified` is a demanding numerical criterion: a dataset can contribute valid MLE estimates
+even if one method narrowly misses its score tolerance. The spread columns compare only certified
+fits, and `at_least_one_certified` makes missing datasets visible. A small likelihood spread supports
+agreement between solutions; it does not prove global optimality. We compare likelihoods **within**
+a fixed dataset and $\nu$, never across contamination levels as if they were the same objective.
+
+```{r}
+preview <- contamination_performance[contamination_performance$scenario=="Data-based",]
+preview$method <- factor(preview$method,levels=c("EM","BFGS","Newton"))
+p <- ggplot(preview,aes(factor(percent),median_ms,color=method,shape=method,group=method))+
+ geom_line(linewidth=.7)+geom_point(size=2.8)+facet_wrap(~nu)+
+ labs(title="Optimizer cost as contamination increases",
+ subtitle="Median of 100 paired fits per level, using common data-based starts",
+ x="Contaminated observations (%)",y="Median elapsed milliseconds",color="Optimizer",shape="Optimizer")+
+ theme_minimal(base_size=12)+theme(legend.position="bottom")
+cat(sprintf("Saved experiment completed: %s. Across %d dataset/nu/contamination cells, the largest certified location spread is %.3g, scale spread %.3g, and log-likelihood spread %.3g.\n",
+ contamination$completed_at,nrow(contamination_checks),max(contamination_checks$mu_spread,na.rm=TRUE),
+ max(contamination_checks$sigma_spread,na.rm=TRUE),max(contamination_checks$loglik_spread,na.rm=TRUE)))
+ggsave("/Users/carl-emilkrarupjensen/Desktop/Kandidat/Compstat/Compstat R/assignment_3/report/figures/contam_cost.png",p,width=6, height=7)
+```
+
+The table's near-machine-precision likelihood gaps are ordinary numerical differences, not evidence
+of statistically different robustness. The runtime preview compares the methods directly: the
+curves summarize computation rather than the statistical location response. Timings include
+uncertified attempts, so they must be read together with the computational report's failure rates.
+Millisecond resolution limits interpretation of small differences.
+The model's choice of $\nu$ determines how outliers affect its fitted location and scale; the optimizer
+determines the computational cost of obtaining that fit. Runtime and convergence success, including
+uncertified outcomes, are therefore the main algorithm comparisons in the computational report.
+The raw paired results and settings are saved in `report/results/contamination.rds`, shared by both
+reports and invalidated when reusable R source files or experiment settings change.
+
+## Fisher information
+
+Let $r=x-\mu$, $a=\nu v$, $d=a+r^2$ and $q=r^2/d$. In $\eta=(\mu,\lambda)$, $\lambda=\log v$,
+the single-observation score and Hessian entries are
+$$
+s_\mu=(\nu+1)r/d,\quad s_\lambda=-1/2+(\nu+1)q/2,
+$$
+$$
+H_{\mu\mu}=(\nu+1)(r^2-a)/d^2,\quad
+H_{\mu\lambda}=-(\nu+1)ar/d^2,\quad
+H_{\lambda\lambda}=-(\nu+1)q(1-q)/2.
+$$
+These expressions are summed in `t_derivatives()` and are also used by Newton.
+Under the model, $q\sim\operatorname{Beta}(1/2,\nu/2)$, so
+$E(q)=1/(\nu+1)$, $E(q^2)=3/[(\nu+1)(\nu+3)]$ and
+$E[q(1-q)]=\nu/[(\nu+1)(\nu+3)]$.
+Using $s_v=s_\lambda/v$ gives $E(s_v^2)=\nu/[2(\nu+3)v^2]$;
+using $r^2/d^2=q(1-q)/(\nu v)$ gives $E(s_\mu^2)=(\nu+1)/[(\nu+3)v]$.
+The cross moment is zero by symmetry (the location score is odd, the scale score even). Thus
+$$
+I_n(\mu,v)=n\begin{pmatrix}(\nu+1)/[(\nu+3)v]&0\\0&\nu/[2(\nu+3)v^2]\end{pmatrix}.
+$$
+The zero entry means expected score orthogonality, not finite-sample independence of the estimates.
+The diagonal entries quantify precision for location and scale squared. Their Gaussian limits are
+$n/v$ and $n/(2v^2)$ respectively.
+
+Observed information is $-H$. For the original parameterization, with $J=\operatorname{diag}(1,1/v)$,
+$$
+H_{(\mu,v)}=J^TH_\eta J-\operatorname{diag}(0,s_\lambda/v^2).
+$$
+The extra score term disappears at an exact stationary point; the implementation includes it even
+away from a maximum. Expected information transforms with the Jacobian alone.
+
+```{r}
+f <- fits$EM
+expected <- expected_information(f$v,5,length(x))
+observed <- observed_information(x,f$mu,f$v,5)
+numeric <- observed_information(x,f$mu,f$v,5,numerical=TRUE)
+knitr::kable(data.frame(parameter=c("mu","v"),expected_SE=sqrt(diag(solve(expected))),
+ observed_SE=sqrt(diag(solve(observed)))),digits=6)
+cat(sprintf("Maximum analytical/numerical information discrepancy: %.3g",max(abs(observed-numeric))))
+grid <- data.frame(nu=seq(0.2,60,length.out=300))
+info <- rbind(data.frame(nu=grid$nu,value=(grid$nu+1)/(grid$nu+3),parameter="v I(mu)"),
+ data.frame(nu=grid$nu,value=grid$nu/(2*(grid$nu+3)),parameter="v^2 I(v)"))
+ggplot(info,aes(nu,value,color=parameter))+geom_line()+labs(title="Standardized information per observation",y="Information",x="nu")
+```
+
+Both standardized information measures increase with $\nu$ at fixed scale. Heavy tails reduce
+information while limiting sensitivity to extremes. Comparing at fixed variance would be a different
+experiment, and cannot include $\nu=2$. Inverse information approximates MLE covariance under a correct
+model and regular large-sample conditions; it is not a numerical optimizer error estimate. Expected
+and observed standard errors differ because the realized sample curvature fluctuates.
+
+
+## Monte Carlo: does Fisher information predict uncertainty?
+
+### Design and what is being measured
+
+We generate **300 independent datasets for each of $\nu=2,5,30$**, each with $n=300$,
+true location $\mu=0$ and true scale $\sigma=1$. Within a scenario, the fitted degrees of
+freedom equal the generating degrees of freedom. There is no contamination in this experiment:
+we are testing uncertainty calculations under the assumed model, not robustness to misspecification.
+Each dataset has its own recorded seed, $32026+1000j+b$, where $j$ indexes the degrees-of-freedom
+scenario and $b$ indexes the replication. Thus the heavy-tailed $\nu=2$ case still has legitimate
+extreme observations, even though it is uncontaminated.
+
+All three optimizers fit each dataset using the same median/half-IQR starting values and the shared
+score tolerance $10^{-7}$. The maximum iteration budget is 200. We select the highest-likelihood
+certified data-based-start fit for the uncertainty calculation, once per dataset. The algorithms
+are alternative ways to calculate an MLE; they are **not three independent estimates for purposes
+of Monte Carlo sample size**. The computational report separately studies their failures, runtimes,
+and a displaced starting point. Failed fits are never used as valid estimates.
+
+```{r}
+#| label: monte-carlo-study
+#| include: false
+mc <- run_monte_carlo(cache_file="results/monte_carlo.rds",source_dir="../project_A")
+```
+
+```{r}
+calibration <- uncertainty_summary(mc)
+cat(sprintf("Experiment completed: %s. The saved result contains all seeds, settings and fit outcomes.\n",mc$completed_at))
+agreement <- do.call(rbind,lapply(split(mc$agreement,mc$agreement$nu),function(g) {
+ data.frame(nu=g$nu[1],generated=nrow(g),datasets_with_fit=sum(g$certified>0),
+            all_three_certified=sum(g$certified==3),max_mu_spread=max(g$mu_spread,na.rm=TRUE),
+            max_sigma_spread=max(g$sigma_spread,na.rm=TRUE))
+}))
+knitr::kable(agreement,digits=7,row.names=FALSE,
+ caption="Paired optimizer agreement from data-based starts. Spreads compare certified fits on the same dataset.")
+```
+
+The agreement table checks that statistical variability is not an artifact of optimizer choice.
+A dataset without any certified fit would be omitted from uncertainty summaries and counted in
+this table; that omission could bias the study if failures were systematic. Agreement between
+certified fits gives numerical evidence, not a proof that every fit reached the global maximum.
+
+### Empirical SD and predicted standard errors
+
+For a parameter $\theta\in\{\mu,\sigma\}$, sampling variability is measured across the $B$ usable datasets:
+$$
+\operatorname{SD}_{\rm empirical}(\hat\theta)=
+\left[\frac1{B-1}\sum_{b=1}^B(\hat\theta_b-\overline{\hat\theta})^2\right]^{1/2}.
+$$
+For each dataset, invert either expected information evaluated at the MLE or observed information
+at the MLE, both in $(\mu,v)$. For observed information we require positive definiteness before
+inverting. Write the resulting covariance approximation as $\widehat\Sigma_b$. Then
+$$
+\widehat{\operatorname{SE}}(\hat\mu_b)=\sqrt{\widehat\Sigma_{b,11}},\qquad
+\widehat{\operatorname{SE}}(\hat\sigma_b)
+=\frac{\sqrt{\widehat\Sigma_{b,22}}}{2\sqrt{\hat v_b}}.
+$$
+The second formula is the delta method for $\sigma=\sqrt v$: a standard error for $v$ cannot
+be relabeled as a standard error for $\sigma$. We average the **standard errors**, not variances,
+across datasets. Expected information predicts, before plugging in $\hat v$,
+$$
+\operatorname{SE}(\hat\mu)\approx\sigma\sqrt{\frac{\nu+3}{n(\nu+1)}},\qquad
+\operatorname{SE}(\hat\sigma)\approx\sigma\sqrt{\frac{\nu+3}{2n\nu}}.
+$$
+
+```{r}
+bias_table <- subset(calibration,information=="Expected",
+ select=c(nu,parameter,datasets,bias,empirical_SD,SD_MCSE))
+knitr::kable(bias_table,digits=4,row.names=FALSE,
+ caption="Sampling behavior. SD_MCSE approximates the simulation error of the empirical SD.")
+knitr::kable(calibration[c("nu","parameter","information","valid_SE","average_SE","SE_SD_ratio","coverage")],
+ digits=4,row.names=FALSE,
+ caption="Uncertainty calibration. SE/SD near 1 and coverage near 0.95 indicate good calibration.")
+comparison <- rbind(
+ data.frame(nu=bias_table$nu,parameter=bias_table$parameter,value=bias_table$empirical_SD,
+            type="Empirical SD",mcse=bias_table$SD_MCSE),
+ data.frame(nu=calibration$nu,parameter=calibration$parameter,value=calibration$average_SE,
+            type=paste("Mean",tolower(calibration$information),"SE"),mcse=NA_real_))
+comparison$type <- factor(comparison$type,levels=c("Empirical SD","Mean expected SE","Mean observed SE"))
+comparison$parameter <- factor(comparison$parameter,levels=c("mu","sigma"),labels=c("Location: mu","Scale: sigma"))
+dodge <- position_dodge(width=.55)
+ggplot(comparison,aes(factor(nu),value,color=type,shape=type,group=type))+
+ geom_point(position=dodge,size=3)+
+ geom_errorbar(aes(ymin=value-1.96*mcse,ymax=value+1.96*mcse),position=dodge,width=.12,na.rm=TRUE)+
+ facet_wrap(~parameter,scales="free_y")+
+ labs(title="Does information predict sampling variability?",
+ subtitle="300 datasets per nu; error bars show approximate Monte Carlo uncertainty in empirical SD",
+ x="Fixed degrees of freedom",y="SD or average standard error",color=NULL,shape=NULL)+
+ theme_minimal(base_size=12)+theme(legend.position="bottom")
+```
+
+A ratio $\overline{\operatorname{SE}}/\operatorname{SD}_{\rm empirical}$ above one means the average
+reported SE is larger than the observed sampling spread; below one means it is smaller. Neither
+one realized estimate nor the average SE is itself the true uncertainty. The empirical SD is also
+estimated from only 300 replications. Its displayed Monte Carlo SE is the normal-approximation
+$\operatorname{SD}_{\rm empirical}/\sqrt{2(B-1)}$; it is a guide to simulation precision, not an
+additional MLE standard error and not exact for nonnormal estimator distributions. At $B=300$
+its relative size is about 4.1%, so small SE/SD discrepancies should not be overinterpreted.
+
+### Confidence-interval coverage
+
+For each information choice, construct the nominal 95% Wald interval
+$\hat\theta_b\pm1.96\widehat{\operatorname{SE}}(\hat\theta_b)$ and count how often it contains the known
+truth. These are symmetric intervals on the original $\mu$ or $\sigma$ scale. The scale intervals
+are a large-sample approximation and need not respect positivity in very small samples; the study
+uses $n=300$. An invalid information inversion is excluded from the coverage denominator, with
+its absence visible in the `valid_SE` column.
+
+```{r}
+coverage_plot <- calibration
+coverage_plot$parameter <- factor(coverage_plot$parameter,levels=c("mu","sigma"),labels=c("Location: mu","Scale: sigma"))
+ggplot(coverage_plot,aes(factor(nu),coverage,color=information,group=information))+
+ geom_hline(yintercept=.95,linetype=2,color="grey40")+
+ geom_errorbar(aes(ymin=pmax(0,coverage-1.96*coverage_MCSE),
+                   ymax=pmin(1,coverage+1.96*coverage_MCSE)),position=position_dodge(.35),width=.1)+
+ geom_point(position=position_dodge(.35),size=2.8)+facet_wrap(~parameter)+
+ scale_y_continuous(labels=function(z) paste0(round(100*z),"%"))+
+ labs(title="Do nominal 95% intervals cover the true parameters?",
+ subtitle="Error bars describe Monte Carlo uncertainty in estimated coverage",
+ x="Fixed degrees of freedom",y="Coverage",color="Information")+
+ theme_minimal(base_size=12)+theme(legend.position="bottom")
+cat(sprintf("Across the six parameter/nu combinations, expected-information SE/SD ratios range from %.3f to %.3f; observed-information ratios range from %.3f to %.3f.\n",
+ min(calibration$SE_SD_ratio[calibration$information=="Expected"]),max(calibration$SE_SD_ratio[calibration$information=="Expected"]),
+ min(calibration$SE_SD_ratio[calibration$information=="Observed"]),max(calibration$SE_SD_ratio[calibration$information=="Observed"])))
+cat(sprintf("Estimated interval coverage ranges from %.1f%% to %.1f%% across the two information calculations.\n",
+ 100*min(calibration$coverage),100*max(calibration$coverage)))
+```
+
+In this run, expected and observed information give very similar average SEs and coverage;
+neither has a clear advantage at this simulation size. Location SEs are close to the empirical
+SD for all three degrees of freedom. For scale at $\nu=30$, however, the empirical SD is about
+0.0464 while the average information-based SE is about 0.0426 (SE/SD about 0.918), and coverage
+is 93%. Thus the results do not support claiming perfect calibration. The discrepancy may combine
+finite-sample approximation error and Monte Carlo variability; more replications would help
+separate them. For $\nu=2$ scale, coverage is instead about 97%. These contrasts are why it is
+useful to inspect both sampling spread and interval coverage.
+
+At true 95% coverage and 300 replications, the Monte Carlo SE of a coverage estimate is
+$\sqrt{0.95(1-0.95)/300}\approx0.0126$, or 1.26 percentage points. The error bars use the estimated
+coverage in this binomial formula. The study can detect substantial miscalibration, but cannot
+reliably rank tiny differences between expected and observed information. They are evaluated on
+the same datasets and their coverage estimates are correlated. Finite-sample bias and departures
+from a normal sampling distribution can affect coverage even when average SE matches empirical SD.
+These correctly specified results do not validate ordinary Fisher-information intervals under
+contamination or a misspecified degrees-of-freedom parameter.
+
+### Reproducibility
+
+The shared `report/results/monte_carlo.rds` stores raw estimates, failures, runtimes, dataset seeds,
+settings and R session details. Both reports read this same experiment, avoiding repeated simulation
+on every render. A change to settings or any reusable R source invalidates the saved result.
+To deliberately obtain fresh runtime measurements, delete the RDS file or call `run_monte_carlo()`
+with `force=TRUE` using the same cache path. Runtime values change across reruns; the seeded datasets
+and converged estimates should reproduce to numerical tolerance.
+
+```{r}
+#| code-fold: true
+sessionInfo()
+```
