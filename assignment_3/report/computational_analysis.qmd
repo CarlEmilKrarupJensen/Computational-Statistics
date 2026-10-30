@@ -1,0 +1,458 @@
+---
+title: "Computational comparison of EM, BFGS and Newton"
+format:
+  html:
+    embed-resources: true
+execute:
+  cache: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+for (file in c("model", "complete_data", "em", "optimization", "fisher_information", "simulation", "experiments")) {
+  source(file.path("..", "project_A", paste0(file, ".R")))
+}
+library(ggplot2)
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, fig.width=9, fig.height=5)
+```
+
+## Algorithms and accuracy
+
+All methods maximize the same marginal likelihood with fixed $\nu$ in $(\mu,\log v)$.
+EM uses conditional latent weights and analytical maximization. BFGS uses `optim()` with the analytical
+negative score. Newton solves $(-H)d=s$ and backtracks until the Armijo ascent condition holds.
+If $-H$ is not positive definite, Newton uses a mean-score ascent direction; line-search failure
+is reported. No method estimates $\nu$.
+
+A fit is accuracy-certified when the maximum absolute component of the mean score, scaled by
+$(\sqrt v,1)$, is at most $10^{-7}$. EM also checks relative likelihood change. BFGS must use
+`optim()`'s native relative stopping rule; it is set tightly and its result must pass the same score
+check. These are comparable final accuracies, not identical internal termination rules. Uncertified
+fits are excluded from runtime rankings. EM likelihood monitoring is part of the measured workload.
+
+## Repeated comparisons
+
+Each $\nu$ uses $n=1000$, true location one, scale squared two, seed $400+\nu$, seven repetitions
+and one warm-up. Within each scenario all methods use identical data and initial parameters.
+Times include history collection and validation, exclude data generation and package loading, and
+are machine-specific. Very short individual timings have limited resolution.
+
+```{r}
+bench <- benchmark_methods()
+knitr::kable(aggregate(cbind(mu,v,loglik,seconds,objective,gradient,hessian)~nu+method,bench,median),digits=6)
+knitr::kable(aggregate(converged~nu+method,bench,mean),digits=3)
+knitr::kable(unique(bench[c("nu","method","iterations")]))
+ggplot(bench,aes(method,seconds,color=method))+geom_point(position=position_jitter(width=.08,height=0))+
+ facet_wrap(~nu,scales="free_y")+labs(title="Seven repeated optimizer timings",y="Elapsed seconds")
+```
+
+BFGS accepted iteration counts are unavailable from base `optim()` and are reported as missing.
+Its function/gradient evaluations describe its effort more faithfully. EM score checks count as
+gradient evaluations; the shared derivative helper also calculates a Hessian during those checks,
+although no Hessian is requested by EM. Counters describe requested optimizer operations, not scalar
+arithmetic. BFGS counters include rejected line-search evaluations.
+
+```{r}
+paths <- list(); summaries <- list()
+for(nu in c(2,5,30)) {
+ x <- simulate_t_data(1000,1,2,nu,seed=400+nu)
+ fits <- fit_all(x,nu); reference <- reference_optimum(x,nu)
+ stopifnot(max(sapply(fits,`[[`,"loglik"))-reference < 1e-6)
+ for(method in names(fits)) {
+   h <- fits[[method]]$history
+   h$gap <- pmax(reference-cummax(h$loglik),1e-12)
+   h$method <- method; h$nu <- nu; paths[[length(paths)+1]] <- h
+ }
+ summaries[[length(summaries)+1]] <- data.frame(nu,reference,
+   largest_final_gap=max(reference-sapply(fits,`[[`,"loglik")))
+}
+paths <- do.call(rbind,paths)
+knitr::kable(do.call(rbind,summaries),digits=9)
+ggplot(paths,aes(iteration,gap,color=method))+geom_line()+scale_y_log10()+facet_wrap(~nu)+
+ labs(title="Best objective gap along optimizer paths",x="Accepted iteration (EM/Newton); objective evaluation (BFGS)",y="Reference log-likelihood minus best attained")
+ggplot(paths,aes(time,gap,color=method))+geom_line()+scale_y_log10()+
+ scale_x_continuous(n.breaks=3,labels=function(z) sprintf("%.3f",z))+facet_wrap(~nu,scales="free_x")+
+ labs(title="Convergence against real elapsed time",x="Elapsed seconds",y="Best objective gap")
+```
+
+The independent reference is a derivative-free Nelder–Mead optimization from three starts, using
+relative tolerance $10^{-13}$. Multiple starts improve confidence but do not prove global optimality.
+The curves show best-so-far likelihood and clip gaps below $10^{-12}$ for logarithmic display;
+trial BFGS points need not improve the objective. Iteration axes have explicitly different meanings,
+so the elapsed-time plot is the primary convergence comparison. Timing-path instrumentation itself
+costs time, and these small problems should not support universal speed claims.
+
+## Runtime distributions and convergence failures across datasets
+
+### Paired simulation design
+
+The seven-repeat benchmark above measures timing variation for one fixed dataset per $\nu$.
+Here we also investigate variation **between datasets**: 300 independent samples of size $n=300$
+for each $\nu=2,5,30$, generated at $\mu=0$, $\sigma=1$ under the correctly specified model.
+These are the exact datasets used for the numerical report's Monte Carlo uncertainty study.
+Every dataset is fitted with all three methods from two common starts:
+
+- **Data-based:** $\mu_0=\operatorname{median}(x)$, $\sigma_0=\operatorname{IQR}(x)/2$.
+- **Displaced:** $\mu_0=\operatorname{median}(x)+5\operatorname{IQR}(x)/2$,
+  $\sigma_0=\operatorname{IQR}(x)/4$.
+
+The displaced start is a controlled initialization challenge, not contamination: the data do not
+change. It begins five initial scale units away and at half the data-based scale. For each start,
+all methods receive the same dataset and parameters, tolerance $10^{-7}$, and maximum iteration
+budget 200. A common iteration budget is a practical limit, not an equal amount of arithmetic:
+iterations have different costs, especially when line searches are required. A failure is an
+exception, a failed native stopping rule, or a result that does not meet the common score criterion.
+It means an accuracy requirement was not certified within this configuration, not that the method
+can never solve the problem. Passing the score check alone does not establish a global maximum.
+
+```{r}
+#| label: monte-carlo-study
+#| include: false
+mc <- run_monte_carlo(cache_file="results/monte_carlo.rds",source_dir="../project_A")
+```
+
+Timing starts immediately before each optimizer call and ends after its return or exception,
+including validation, history collection, and internal line searches, but excluding data generation
+and information-matrix calculations. An unmeasured warm-up precedes the study, and the method order
+rotates across replications to reduce systematic order effects. Each dataset/start/method combination
+is timed once; these distributions combine data difficulty and machine timing noise. They complement,
+rather than replace, the repeated fixed-data timings above. Very short values have millisecond-scale
+measurement resolution. Fits that fail still take time and are included in the distributions and
+timing summaries; their speed must not be interpreted as successful optimization.
+
+```{r}
+performance <- runtime_summary(mc)
+performance$scenario <- factor(performance$scenario,levels=c("Data-based","Displaced"))
+performance$method <- factor(performance$method,levels=c("EM","BFGS","Newton"))
+mc_fits <- mc$fits
+mc_fits$scenario <- factor(mc_fits$scenario,levels=c("Data-based","Displaced"))
+mc_fits$method <- factor(mc_fits$method,levels=c("EM","BFGS","Newton"))
+cat(sprintf("Saved experiment completed: %s. This table covers %d timed fits.\n",mc$completed_at,nrow(mc_fits)))
+performance_table <- performance[c("scenario","nu","method","fits","failures","median_ms","p90_ms")]
+performance_table$failure_percent <- round(100*performance$failure_rate,1)
+knitr::kable(performance_table,digits=2,row.names=FALSE,
+ caption="Across-dataset performance: median and 90th-percentile elapsed milliseconds; all attempted fits included.")
+```
+
+```{r}
+#| fig-height: 7
+ggplot(mc_fits,aes(method,1000*seconds,fill=method))+
+ geom_point(position=position_jitter(width=.14,height=0,seed=32026),
+            color="grey40",alpha=.15,size=.7)+
+ geom_boxplot(width=.35,outlier.shape=NA,alpha=.7)+
+ geom_point(data=subset(mc_fits,!converged),shape=4,color="firebrick",size=1.5)+
+ facet_grid(scenario~nu,scales="free_y")+
+ labs(title="Runtime distributions across simulated datasets",
+ subtitle="300 datasets per panel and method; red crosses mark uncertified fits",
+ x=NULL,y="Elapsed milliseconds (includes failed fits)")+
+ theme_minimal(base_size=12)+theme(legend.position="none")
+```
+
+The box shows the median and interquartile range; faint points show individual fits.
+Points are spread horizontally only to expose ties; no artificial noise is added to elapsed times.
+A smoothed density would be misleading for the many timings tied at millisecond resolution. Rows have different timing scales to make the displaced-start behavior readable; do not
+compare physical heights between rows without reading the axes. Long tails indicate occasional
+expensive fits that a median alone would hide. The 90th percentile in the table quantifies this
+upper-runtime behavior without relying on one extreme observation.
+
+```{r}
+#| fig-height: 6
+ggplot(performance,aes(method,failure_rate,color=method))+
+ geom_errorbar(aes(ymin=failure_lower,ymax=failure_upper),width=.15)+geom_point(size=2.8)+
+ facet_grid(scenario~nu)+
+ scale_y_continuous(labels=function(z) paste0(round(100*z,1),"%"))+
+ labs(title="Convergence-failure rates under the shared accuracy check",
+ subtitle="Points: observed proportions; bars: 95% Wilson intervals (300 datasets per group)",
+ x=NULL,y="Uncertified fits / attempted fits")+
+ theme_minimal(base_size=12)+theme(legend.position="none")
+```
+
+Wilson intervals remain informative when no failures occur: zero observed failures in 300 datasets
+does not establish a zero underlying failure probability. The intervals describe repeated-dataset
+uncertainty for each method and scenario. Because optimizers share datasets, these are paired
+outcomes; overlapping or nonoverlapping marginal intervals are not a formal paired comparison.
+The seeds and complete failure records are saved, so an individual problematic dataset can be
+recreated rather than attributing a failed fit to the statistical model's heavy tails alone.
+
+```{r}
+for(scenario in c("Data-based","Displaced")) {
+ selected <- performance[as.character(performance$scenario)==scenario,]
+ cat(sprintf("From %s starts, %d of %d fits were uncertified (%.2f%%).\n",tolower(scenario),
+ sum(selected$failures),sum(selected$fits),100*sum(selected$failures)/sum(selected$fits)))
+ for(nu in c(2,5,30)) {
+   group <- selected[selected$nu==nu,]
+   cat(sprintf("At nu=%s, median runtimes span %.1f–%.1f ms and observed failure rates span %.1f–%.1f%%.\n",
+   nu,min(group$median_ms),max(group$median_ms),100*min(group$failure_rate),100*max(group$failure_rate)))
+ }
+}
+```
+
+### Are the uncertified fits materially wrong?
+
+A binary tolerance check can flag a nearly converged fit. To distinguish that case from a poor
+solution, compare each uncertified fit with the best certified likelihood on the same dataset
+(across starts). The following diagnostic reports the score residual and the likelihood gap;
+it is not used to relax the success definition after seeing the results.
+
+```{r}
+certified_reference <- aggregate(loglik~nu+replication,subset(mc_fits,converged),max)
+uncertified <- merge(subset(mc_fits,!converged),certified_reference,
+                     by=c("nu","replication"),suffixes=c("","_reference"))
+if(nrow(uncertified)>0) {
+ diagnostics <- data.frame(uncertified_fits=nrow(uncertified),
+   min_score_over_tolerance=min(uncertified$score,na.rm=TRUE)/mc$settings$tol,
+   max_score_over_tolerance=max(uncertified$score,na.rm=TRUE)/mc$settings$tol,
+   largest_loglik_gap=max(uncertified$loglik_reference-uncertified$loglik,na.rm=TRUE))
+ knitr::kable(diagnostics,digits=c(0,2,2,12),row.names=FALSE,
+ caption="Accuracy of uncertified fits relative to the paired certified reference.")
+} else cat("No uncertified fits were observed.")
+```
+
+In this saved experiment, the uncertified results are BFGS fits that fall just short of the score
+requirement. Their likelihoods are essentially indistinguishable from the paired certified fits
+at the displayed statistical precision. This reflects the mismatch between `optim()`'s native
+relative-objective stopping rule and our post-fit score certification, rather than evidence that
+BFGS has found statistically different estimates. A tighter or differently controlled termination
+procedure could change these rates. We retain the predefined rule and report both the binary
+outcome and its numerical size rather than changing settings to hide failures.
+
+A fast optimizer that misses the requested tolerance is not a substitute for a slower certified
+fit. Read the runtime and failure plots together. The common score check makes reported successes
+comparable even though BFGS uses its native stopping rule internally. The study does not tune starts,
+iteration limits or tolerances separately to favor an optimizer. Its results are conditional on
+the chosen sample size, start rules, and implementation instrumentation, and do not imply universal
+rankings. In particular, changing optimization methods should not change the MLE's sampling uncertainty
+when they reach the same maximum; the numerical report verifies this with paired estimate spreads.
+
+The raw experiment is shared through `report/results/monte_carlo.rds`. It is reused across report
+renders when settings and R sources match. The saved timestamp identifies when the timings were
+actually measured. Delete the file or use `force=TRUE` in `run_monte_carlo()` for fresh measurements;
+data seeds remain reproducible, while runtime distributions naturally vary.
+
+## Does contamination change optimizer performance?
+
+### Controlled design
+
+This replaces the one-outlier robustness illustration with a **paired algorithm comparison**.
+The numerical report explains the model's weighting mechanism and checks agreement of certified
+estimates. Here the outcomes are runtime, convergence success and numerical accuracy.
+
+There are 100 independent $t_5$ baseline datasets ($n=500$, location 0, scale 1; seed $47000+b$).
+Each baseline supplies three samples with exactly 0%, 1% or 5% of its observations replaced by
+independent $N(15,1)$ values. The randomly selected positions and outlier values are nested across
+levels. Each sample is fitted with fixed $\nu=2,5,30$ using every optimizer and two common starts:
+
+- **Data-based:** sample median and half-IQR scale.
+- **Displaced:** that location plus five initial scale units, with half the initial scale.
+
+Starts are recomputed for each contaminated sample and are identical across optimizers and fixed
+$\nu$ values. Thus the study measures the full effect of contamination, including on initialization.
+All data and starts are paired between methods. The displaced start changes initialization while
+holding the sample fixed. Contamination changes the data; it is not a different optimizer or a
+change in fitted $\nu$. The fitted tail assumptions differ while the baseline generating model
+remains $t_5$. We study only one-sided distant contamination, so other outlier mechanisms may behave differently.
+
+We keep the same accuracy check $10^{-7}$ and maximum iteration budget 200 for every method.
+Iteration limits are not equal-work budgets: line searches and curvature computations differ.
+Each dataset/level/nu/start/method fit is timed once, after an unmeasured warm-up, with method order
+rotated across replications. Timings include validation, trace collection and unsuccessful fits,
+and exclude data generation and summary calculations. These are workload distributions across
+100 datasets, not 100 repetitions of one fixed input. There are **5,400 timed fits** in this study.
+
+```{r}
+#| label: contamination-study
+#| include: false
+contamination <- run_contamination_study(cache_file="results/contamination.rds",source_dir="../project_A")
+contamination_performance <- contamination_summary(contamination)
+contamination_checks <- contamination_agreement(contamination)
+```
+
+```{r}
+cp <- contamination_performance
+cp$method <- factor(cp$method,levels=c("EM","BFGS","Newton"))
+cp$scenario <- factor(cp$scenario,levels=c("Data-based","Displaced"))
+cf <- contamination$fits
+cf$method <- factor(cf$method,levels=c("EM","BFGS","Newton"))
+cf$scenario <- factor(cf$scenario,levels=c("Data-based","Displaced"))
+cf$percent <- 100*cf$fraction
+compact <- cp[c("scenario","nu","percent","method")]
+compact$entry <- sprintf("%.1f / %.1f / %d",cp$median_ms,cp$p90_ms,cp$failures)
+compact <- reshape(compact,idvar=c("scenario","nu","percent"),timevar="method",direction="wide")
+names(compact) <- sub("entry\\.","",names(compact))
+compact <- compact[order(compact$scenario,compact$nu,compact$percent),]
+knitr::kable(compact,row.names=FALSE,
+ caption="Each method cell: median ms / 90th-percentile ms / uncertified fits out of 100. Failed fits remain in timing summaries.")
+cat(sprintf("Timings were measured in the saved run completed %s.\n",contamination$completed_at))
+```
+
+### Runtime distributions
+
+```{r}
+#| fig-height: 7
+ggplot(cf,aes(factor(percent),1000*seconds,fill=method))+
+ geom_boxplot(position=position_dodge(.75),width=.65,outlier.size=.7,alpha=.7)+
+ facet_grid(scenario~nu,scales="free_y")+
+ labs(title="Optimizer runtime as contamination increases",
+ subtitle="100 paired datasets per level; all attempts included",
+ x="Contaminated observations (%)",y="Elapsed milliseconds",fill="Optimizer")+
+ theme_minimal(base_size=12)+theme(legend.position="bottom")
+```
+
+Each box describes one optimizer at a contamination level: the center is the median, the box spans
+the interquartile range, and points beyond the whiskers expose unusually expensive fits. Rows have
+separate y-scales, so compare their numerical axes rather than physical box heights. Methods share
+datasets, and contamination levels share baselines. A consistently shifted distribution is more
+informative than a single unusually fast or slow fit. Millisecond resolution and timing instrumentation
+limit conclusions about very small differences. A fast failed fit is not an accurate MLE.
+
+### Convergence success
+
+A fit is uncertified if an exception occurs, its native convergence test fails, or its final mean
+score exceeds the shared dimensionless tolerance. We do not silently exclude it or redefine the
+criterion after seeing the data. The following plot shows failure proportions with 95% Wilson
+intervals. Zero failures out of 100 still allows an underlying probability of roughly 3.7% at the
+upper Wilson bound; it is not proof of perfect reliability. These intervals are marginal uncertainty
+summaries, not a formal test of paired differences between optimizers.
+
+```{r}
+#| fig-height: 6.5
+ggplot(cp,aes(factor(percent),failure_rate,color=method,group=method))+
+ geom_line(position=position_dodge(.35))+
+ geom_errorbar(aes(ymin=failure_lower,ymax=failure_upper),position=position_dodge(.35),width=.1)+
+ geom_point(position=position_dodge(.35),size=2.2)+facet_grid(scenario~nu)+
+ scale_y_continuous(labels=function(z) paste0(round(100*z),"%"))+
+ labs(title="Does contamination make convergence less reliable?",
+ subtitle="Uncertified fits under the same score tolerance; bars are 95% Wilson intervals",
+ x="Contaminated observations (%)",y="Uncertified attempts",color="Optimizer")+
+ theme_minimal(base_size=12)+theme(legend.position="bottom")
+```
+
+### Final likelihood agreement and size of tolerance misses
+
+We compare certified solutions only within the **same dataset, contamination level and fixed $\nu$**.
+The reference is the largest certified likelihood across methods and both starts. It is a best-attained
+reference, not a proven global optimum; it suffices for an agreement check. The numerical report shows
+the distribution of certified likelihood spreads. Here we also inspect uncertified outputs: a score
+just above $10^{-7}$ is a different issue from a materially worse likelihood.
+
+```{r}
+checks <- contamination_checks
+max_or_na <- function(x) if(all(is.na(x))) NA_real_ else max(x,na.rm=TRUE)
+accuracy_table <- do.call(rbind,lapply(split(checks,interaction(checks[c("nu","percent")],drop=TRUE)),function(g) {
+ data.frame(nu=g$nu[1],percent=g$percent[1],datasets_without_certified_fit=sum(g$certified==0),
+ max_certified_loglik_spread=max_or_na(g$loglik_spread),
+ largest_uncertified_loglik_gap=max_or_na(g$uncertified_gap),
+ largest_uncertified_score=max_or_na(g$uncertified_score))
+}))
+accuracy_table <- accuracy_table[order(accuracy_table$nu,accuracy_table$percent),]
+for(column in c("max_certified_loglik_spread","largest_uncertified_loglik_gap","largest_uncertified_score"))
+ accuracy_table[[column]] <- ifelse(is.na(accuracy_table[[column]]),"NA",formatC(accuracy_table[[column]],format="e",digits=2))
+knitr::kable(accuracy_table,row.names=FALSE,
+ caption="Numerical agreement and tolerance misses; NA means no uncertified finite-likelihood output in that cell.")
+```
+
+Small gaps show that a binary failure rate can exaggerate practical differences in the estimates.
+Large gaps, if present, would instead warrant investigation of initialization, curvature, or local
+solutions. A failed fit remains failed under the declared rule in either case. The error records,
+seeds, starting parameters and score residuals are retained in the RDS file for diagnosis.
+
+```{r}
+for(scenario in c("Data-based","Displaced")) {
+ for(method in c("EM","BFGS","Newton")) {
+  selected <- cp[as.character(cp$scenario)==scenario & as.character(cp$method)==method,]
+  cat(sprintf("%s / %s: %d uncertified fits out of %d attempts across the three contamination levels and fitted nu values.\n",
+  scenario,method,sum(selected$failures),sum(selected$fits)))
+ }
+}
+cat(sprintf("Largest likelihood spread among certified fits: %.3g.\n",max(checks$loglik_spread,na.rm=TRUE)))
+for(method in c("EM","BFGS","Newton")) {
+ selected <- cp[cp$nu==30 & as.character(cp$scenario)=="Displaced" & as.character(cp$method)==method,]
+ cat(sprintf("For nu=30 from displaced starts, %s median runtime changed from %.1f ms at 0%% contamination to %.1f ms at 5%%.\n",
+ method,selected$median_ms[selected$percent==0],selected$median_ms[selected$percent==5]))
+}
+cat(sprintf("Among uncertified finite-likelihood results, the largest gap from a paired certified reference is %.3g; the largest score residual is %.2f times the prescribed tolerance.\n",
+ max(checks$uncertified_gap,na.rm=TRUE),max(checks$uncertified_score,na.rm=TRUE)/contamination$settings$tol))
+
+```
+
+In this run, all EM and Newton attempts were certified; the uncertified BFGS outcomes were
+near-tolerance misses with almost identical likelihoods, rather than substantially different solutions.
+Nevertheless, the displaced-start runtime comparison at $\nu=30$ reveals that contamination can
+increase computational effort even when the final estimates agree. The runtime changes differ
+between optimizers, so model robustness alone does not predict optimization speed.
+
+Read the runtime and failure plots together. Contamination need not slow every method monotonically:
+it changes curvature, relative weights, data-based starts and native stopping behavior. Any observed
+trend is conditional on this contamination mechanism and these implementations. The experiment
+compares the cost of reaching a common likelihood solution, not different statistical robustness
+for different optimizers. The statistical response to outliers depends on the fitted $\nu$.
+
+The saved `report/results/contamination.rds` is shared by both reports and contains the raw paired
+results. Delete it or call `run_contamination_study(..., force=TRUE)` for fresh timings. Code or
+setting changes invalidate the cache. Its saved timestamp identifies the actual measurement run.
+
+## Profiling and a targeted improvement
+
+We profile 25 readable EM fits on $n=20000$ observations from $t_2$ (seed 188), sampling every
+2 ms. Profiling is statistical: sampled proportions vary across runs. The following table contains
+actual inclusive and self times, not predicted bottlenecks.
+
+```{r}
+profile <- profile_em()
+relevant <- profile$profile$by.total
+relevant <- relevant[grepl("fit_em|em_step|complete_data|joint_logdensity|conditional_weights|t_loglik|t_derivatives|score_error|validate_model", rownames(relevant)), , drop=FALSE]
+knitr::kable(relevant)
+knitr::kable(head(profile$profile$by.self,8))
+cat(sprintf("Total sampled time: %.3f seconds.",profile$profile$sampling.time))
+```
+
+The self-time table shows that instrumentation (`proc.time`) can itself dominate this small
+profiled workload. Marginal density evaluations (`dt`) and derivative calculations also contribute;
+therefore the profile describes the monitored implementation, rather than just mathematical EM
+updates. Repeated vector allocations are visible indirectly in these R operations; this profile
+does not measure allocation volume. Removing all timing would prevent the requested real-time
+convergence curves, so the same timing policy is retained for the comparison.
+
+The readable M-step calls `complete_data_mle()`, which validates by evaluating the complete joint
+density. EM only needs weighted sums once its data and weights are valid. The optional `optimized=TRUE`
+branch eliminates that unused density evaluation and uses the same weighted formulas. This is a
+small duplication kept next to the original update to make the measured change easy to inspect.
+The following repeated timings determine whether it helps on this workload; no C++ is required to
+remove unused work. Other entries, such as marginal density evaluation and derivative calculations,
+remain candidates for future work rather than unmeasured speedup claims.
+
+```{r}
+comparison <- profile$comparison
+stopifnot(max(abs(comparison$mu-comparison$mu[1]))<1e-12,
+          max(abs(comparison$v-comparison$v[1]))<1e-12,
+          max(abs(comparison$loglik-comparison$loglik[1]))<1e-9,
+          all(comparison$converged))
+knitr::kable(aggregate(seconds~optimized,comparison,median),digits=5)
+speedup <- median(comparison$seconds[!comparison$optimized])/median(comparison$seconds[comparison$optimized])
+cat(sprintf("Measured median speed ratio (readable / streamlined): %.2f. No compilation time is involved.",speedup))
+```
+
+## Conclusions supported by this run
+
+```{r}
+for(nu in c(2,5,30)) {
+ selected <- bench[bench$nu==nu & bench$converged,]
+ timing <- aggregate(seconds~method,selected,median)
+ winner <- timing$method[which.min(timing$seconds)]
+ cat(sprintf("For nu = %s, %s has the smallest median time among certified fits. ",nu,winner))
+}
+cat(sprintf("Across all recorded benchmark fits, %d of %d passed the common accuracy check.",sum(bench$converged),nrow(bench)))
+```
+
+EM's update is easy to derive and monotone; Newton requires more derivative and line-search code;
+BFGS relies on a standard optimizer and supplies intermediate effort through evaluation counts.
+The measured winners apply to these sample sizes, starts and implementations. EM iteration counts
+alone cannot establish efficiency. Statistical robustness is controlled by $\nu$; computational cost
+is controlled by the optimizer and its implementation. Tests validate the density, EM updates,
+derivatives and information before these performance experiments.
+
+```{r}
+#| code-fold: true
+sessionInfo()
+```
