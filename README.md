@@ -1,4 +1,4 @@
-# Computational-Statistics
+Computational-Statistics
 This repository contains solutions to the four exam assignments for the course on Computational Statistics at the University of Copenhagen.
 
 Each project is organized in its own folder:
@@ -16,7 +16,7 @@ The projects combine statistical methodology with computational implementation, 
 
 ## Repository structure
 
-Each assignment folder contains the code, report, figures, and supporting functions and presentation material.
+Each assignment folder contains the project code, reports, supporting functions, tests, and presentation material for that assignment. The Quarto reports contain the numerical investigations, computational comparisons, and figures.
 
 The general workflow across the projects is:
 
@@ -51,63 +51,72 @@ The project includes:
 
 ---
 
-## Assignment 2 — [Project title]
+## Assignment 2 — Project B: Importance Sampling for Finite-Horizon Ruin
 
-**Topic:** [One-sentence description of the project]
+This project estimates the probability that a random walk crosses a ruin threshold within a fixed time horizon, using exponential tilting to make rare events easier to simulate.
 
-Main components:
+The project includes:
 
-- [method or model implemented],
-- [simulation or empirical study],
-- [computational aspect],
-- [comparison with alternatives],
-- [main statistical or computational question].
+- crude Monte Carlo, full-path importance sampling, and stopped-path importance sampling,
+- likelihood-ratio weights and unbiasedness arguments for the importance sampling estimators,
+- pilot selection of the tilting parameter and independent validation,
+- comparison of estimator variance, Monte Carlo uncertainty, and relative efficiency,
+- analysis of variance-minimizing versus computing-cost-adjusted tilts,
+- early stopping and survivor-index bookkeeping to reduce simulation work,
+- correctness testing, profiling, and runtime benchmarking,
+- comparison of the computing time required to achieve a target precision.
 
 ### Key questions
 
-- [Question 1]
-- [Question 2]
-- [Question 3]
+- How much can exponential tilting improve precision for a rare ruin event?
+- How does stopping at ruin affect runtime and estimator variance?
+- Does the variance-minimizing tilt also minimize the time needed for a given precision?
 
 ---
 
-## Assignment 3 — [Project title]
+## Assignment 3 — Project A: Student's t Estimation with EM
 
-**Topic:** [One-sentence description of the project]
+This project estimates the location and scale of a Student's t distribution with fixed degrees of freedom, using its latent-variable representation to derive an expectation-maximization (EM) algorithm.
 
-Main components:
+The project includes:
 
-- [method or model implemented],
-- [simulation or empirical study],
-- [computational aspect],
-- [comparison with alternatives],
-- [main statistical or computational question].
+- derivation of the complete-data likelihood and EM updates,
+- maximum-likelihood estimation using EM, BFGS, and Newton methods,
+- validation of likelihoods, derivatives, information calculations, and optimization routines,
+- contamination studies examining robustness and optimizer reliability,
+- Fisher information, standard errors, and confidence intervals,
+- Monte Carlo evaluation of estimation uncertainty and interval coverage,
+- comparison of convergence, likelihood agreement, and runtime across datasets,
+- profiling and targeted computational improvements.
 
 ### Key questions
 
-- [Question 1]
-- [Question 2]
-- [Question 3]
+- How do the EM weights explain robustness to outlying observations?
+- How do EM, BFGS, and Newton compare in speed and convergence reliability?
+- How well does Fisher information predict uncertainty and confidence-interval coverage?
 
 ---
 
-## Assignment 4 — [Project title]
+## Assignment 4 — Project B: Gradient Methods for Dose-Response Curves
 
-**Topic:** [One-sentence description of the project]
+This project fits a four-parameter logistic dose-response curve by nonlinear least squares and compares deterministic and stochastic gradient methods.
 
-Main components:
+The project includes:
 
-- [method or model implemented],
-- [simulation or empirical study],
-- [computational aspect],
-- [comparison with alternatives],
-- [main statistical or computational question].
+- analytical gradients and Hessians, with derivative checks and local geometry diagnostics,
+- full-gradient descent with Armijo backtracking,
+- stochastic gradient descent, Polyak and Nesterov momentum, and AdaGrad,
+- sensitivity studies for starting values, learning rates, sample size, and local conditioning,
+- comparison of fitted curves and objective values against a multi-start BFGS reference,
+- accuracy-versus-time comparisons, profiling, and memory measurements,
+- exact compression of repeated-dose data,
+- comparison of R and compiled C++ implementations of stochastic gradient descent.
 
 ### Key questions
 
-- [Question 1]
-- [Question 2]
-- [Question 3]
+- When do momentum and adaptive scaling improve convergence?
+- How do starting values, learning rates, and local geometry affect numerical accuracy?
+- How do repeated-dose compression and compiled implementations change runtime and memory costs?
 
 ---
 
@@ -115,13 +124,16 @@ Main components:
 
 The projects are primarily implemented in R and use tools such as:
 
-- Quarto for reports,
+- Quarto for reports and presentation material,
 - `testthat` for correctness testing,
 - `bench` for benchmarking,
 - `Rprof()` and related profiling tools for identifying bottlenecks,
-- `ggplot2` for visualization.
+- `ggplot2` for visualization,
+- Rcpp and C++ for selected performance-critical routines.
 
 The emphasis throughout the repository is not only on obtaining statistically correct results, but also on understanding the computational cost and trade-offs of different implementations.
+
+
 
 
 
